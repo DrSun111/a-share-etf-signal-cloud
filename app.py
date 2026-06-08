@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import math
 import re
+import html
 from datetime import date, datetime, timedelta
+from io import StringIO
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 from plotly.subplots import make_subplots
 
@@ -297,10 +300,49 @@ def get_fund_names() -> tuple[pd.DataFrame | None, dict[str, Any]]:
     return run_call("全部基金名称-东方财富/天天基金", ak.fund_name_em)
 
 
+def fetch_open_fund_nav_history_em(code: str, max_pages: int = 35) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for page in range(1, max_pages + 1):
+        url = f"https://fundf10.eastmoney.com/F10DataApi.aspx?type=lsjz&code={code}&page={page}&per=20&sdate=&edate="
+        resp = requests.get(url, headers=headers, timeout=12)
+        resp.raise_for_status()
+        match = re.search(r'content:"(.*?)",records:', resp.text, flags=re.S)
+        if not match:
+            break
+        content = html.unescape(match.group(1).replace(r"\/", "/").replace(r"\"", '"'))
+        tables = pd.read_html(StringIO(content))
+        if not tables:
+            break
+        page_df = tables[0]
+        if page_df.empty:
+            break
+        frames.append(page_df)
+        pages_match = re.search(r"pages:(\d+)", resp.text)
+        if pages_match and page >= int(pages_match.group(1)):
+            break
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True).drop_duplicates()
+    keep = [col for col in ["净值日期", "单位净值", "累计净值", "日增长率"] if col in df.columns]
+    df = df[keep].copy()
+    df["净值日期"] = pd.to_datetime(df["净值日期"], errors="coerce")
+    for col in ["单位净值", "累计净值", "日增长率"]:
+        if col in df.columns:
+            df[col] = numeric_series(df[col])
+    return df.dropna(subset=["净值日期"]).sort_values("净值日期").reset_index(drop=True)
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def get_open_fund_nav_trend(code: str, indicator: str = "单位净值走势") -> tuple[pd.DataFrame | None, dict[str, Any]]:
     df, status = run_call(f"场外基金{indicator}", ak.fund_open_fund_info_em, symbol=code, indicator=indicator, period="成立来")
     if df is None:
+        try:
+            fallback = fetch_open_fund_nav_history_em(code)
+            if not fallback.empty:
+                return fallback, data_status("场外基金历史净值-东方财富F10兜底", True, f"{len(fallback):,} 行")
+        except Exception as exc:  # noqa: BLE001 - fallback is best effort.
+            status = data_status(status["label"], False, f"{status['detail']}；兜底失败 {type(exc).__name__}: {exc}")
         return None, status
     out = df.copy()
     date_col = "净值日期" if "净值日期" in out.columns else out.columns[0]
@@ -308,7 +350,16 @@ def get_open_fund_nav_trend(code: str, indicator: str = "单位净值走势") ->
     for col in out.columns:
         if col != date_col:
             out[col] = numeric_series(out[col])
-    return out.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True), status
+    out = out.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True)
+    if out.empty:
+        try:
+            fallback = fetch_open_fund_nav_history_em(code)
+            if not fallback.empty:
+                return fallback, data_status("场外基金历史净值-东方财富F10兜底", True, f"{len(fallback):,} 行")
+        except Exception as exc:  # noqa: BLE001
+            return None, data_status(status["label"], False, f"返回为空；兜底失败 {type(exc).__name__}: {exc}")
+    return out, status
+
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1055,6 +1106,295 @@ def score_model(
     return details
 
 
+def otc_nav_to_price_df(nav_df: pd.DataFrame | None) -> pd.DataFrame:
+    if nav_df is None or nav_df.empty:
+        return pd.DataFrame()
+    df = nav_df.copy()
+    date_col = "净值日期" if "净值日期" in df.columns else df.columns[0]
+    nav_col = "单位净值" if "单位净值" in df.columns else None
+    if nav_col is None:
+        candidates = [col for col in df.columns if col != date_col]
+        nav_col = candidates[0] if candidates else None
+    if nav_col is None:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(
+        {
+            "date": pd.to_datetime(df[date_col], errors="coerce"),
+            "close": numeric_series(df[nav_col]),
+        }
+    ).dropna(subset=["date", "close"])
+    if out.empty:
+        return pd.DataFrame()
+    out = out.sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    if "日增长率" in df.columns:
+        pct_map = pd.DataFrame({"date": pd.to_datetime(df[date_col], errors="coerce"), "vendor_pct": numeric_series(df["日增长率"])})
+        out = out.merge(pct_map.dropna(subset=["date"]).drop_duplicates("date"), on="date", how="left")
+    else:
+        out["vendor_pct"] = np.nan
+    out["pct"] = out["vendor_pct"].combine_first(out["close"].pct_change() * 100)
+    prev_close = out["close"].shift().fillna(out["close"])
+    out["open"] = prev_close
+    out["high"] = pd.concat([prev_close, out["close"]], axis=1).max(axis=1)
+    out["low"] = pd.concat([prev_close, out["close"]], axis=1).min(axis=1)
+    out["volume"] = 1.0
+    out["amount"] = (out["pct"].abs().fillna(0) + 1) * 10000
+    return out[["date", "open", "high", "low", "close", "volume", "amount", "pct"]]
+
+
+def achievement_value(df: pd.DataFrame | None, period: str, col: str) -> float:
+    if df is None or df.empty or "周期" not in df.columns or col not in df.columns:
+        return np.nan
+    hit = df[df["周期"].astype(str) == period]
+    if hit.empty:
+        return np.nan
+    return to_num(hit.iloc[0].get(col))
+
+
+def achievement_rank_score(df: pd.DataFrame | None, period: str) -> float:
+    if df is None or df.empty or "周期" not in df.columns or "周期收益同类排名" not in df.columns:
+        return 50.0
+    hit = df[df["周期"].astype(str) == period]
+    if hit.empty:
+        return 50.0
+    text = str(hit.iloc[0].get("周期收益同类排名", ""))
+    match = re.search(r"(\d+)\s*/\s*(\d+)", text)
+    if not match:
+        return 50.0
+    rank = float(match.group(1))
+    total = max(float(match.group(2)), 1.0)
+    return clamp((total - rank + 1) / total * 100)
+
+
+def asset_position(asset_df: pd.DataFrame | None, keyword: str) -> float:
+    if asset_df is None or asset_df.empty or "资产类型" not in asset_df.columns or "仓位占比" not in asset_df.columns:
+        return np.nan
+    hit = asset_df[asset_df["资产类型"].astype(str).str.contains(keyword, na=False)]
+    if hit.empty:
+        return np.nan
+    return to_num(hit.iloc[0].get("仓位占比"))
+
+
+def score_open_fund_model(
+    nav_df: pd.DataFrame | None,
+    index_df: pd.DataFrame | None,
+    open_fund_daily: pd.DataFrame | None,
+    otc_row: pd.Series | None,
+    achievement_df: pd.DataFrame | None,
+    asset_df: pd.DataFrame | None,
+    holding_impact: pd.DataFrame | None,
+    sector_df: pd.DataFrame | None,
+    sector_name: str | None,
+    market_env: dict[str, Any],
+) -> dict[str, Any]:
+    price_df = otc_nav_to_price_df(nav_df)
+    ind = add_indicators(price_df) if len(price_df) >= 2 else pd.DataFrame()
+    idx = add_indicators(index_df) if index_df is not None and len(index_df) >= 65 else None
+    has_nav = not ind.empty
+    last = ind.iloc[-1] if has_nav else pd.Series(dtype="float64")
+    close = to_num(last.get("close"))
+
+    above_ma = sum(close > to_num(last.get(f"ma{w}")) for w in [5, 10, 20, 60]) if has_nav else 0
+    alignment = sum(
+        [
+            to_num(last.get("ma5")) > to_num(last.get("ma10")),
+            to_num(last.get("ma10")) > to_num(last.get("ma20")),
+            to_num(last.get("ma20")) > to_num(last.get("ma60")),
+        ]
+    ) if has_nav else 0
+    slope5 = (last["ma5"] / ind["ma5"].iloc[-6] - 1) * 100 if len(ind) >= 6 and pd.notna(ind["ma5"].iloc[-6]) and ind["ma5"].iloc[-6] else np.nan
+    slope20 = (last["ma20"] / ind["ma20"].iloc[-6] - 1) * 100 if len(ind) >= 26 and pd.notna(ind["ma20"].iloc[-6]) and ind["ma20"].iloc[-6] else np.nan
+    breakout20 = (close / to_num(last.get("high20")) - 1) * 100 if has_nav and to_num(last.get("high20")) else np.nan
+    breakout60 = (close / to_num(last.get("high60")) - 1) * 100 if has_nav and to_num(last.get("high60")) else np.nan
+    rel_strength = np.nan
+    if idx is not None and len(idx) >= 21 and has_nav:
+        rel_strength = to_num(last.get("return20")) - to_num(idx.iloc[-1].get("return20"))
+    trend_score = clamp(
+        above_ma / 4 * 28
+        + alignment / 3 * 22
+        + linear_score(slope5, -1.5, 3.0) * 0.14
+        + linear_score(slope20, -2.5, 4.5) * 0.12
+        + linear_score(breakout20, -8, 1.5) * 0.12
+        + linear_score(breakout60, -15, 1.0) * 0.06
+        + linear_score(rel_strength, -7, 8) * 0.06
+    )
+
+    daily_pct = to_num(otc_row.get("日增长率")) if otc_row is not None else to_num(last.get("pct"))
+    ret5 = to_num(last.get("return5"))
+    ret10 = to_num(last.get("return10"))
+    ret20 = to_num(last.get("return20"))
+    positive_days5 = int((ind["pct"].tail(5) > 0).sum()) if has_nav and "pct" in ind.columns else 0
+    month_ret = achievement_value(achievement_df, "近1月", "本产品区间收益")
+    quarter_ret = achievement_value(achievement_df, "近3月", "本产品区间收益")
+    ytd_ret = achievement_value(achievement_df, "今年以来", "本产品区间收益")
+    achievement_rank = np.mean([achievement_rank_score(achievement_df, p) for p in ["近1月", "近3月", "今年以来"]])
+    momentum_score = clamp(
+        linear_score(daily_pct, -2.5, 2.8) * 0.16
+        + linear_score(ret5, -4.5, 6.5) * 0.18
+        + linear_score(ret20, -9, 13) * 0.16
+        + linear_score(positive_days5, 1, 4) * 0.12
+        + linear_score(month_ret, -10, 10) * 0.13
+        + linear_score(quarter_ret, -16, 20) * 0.12
+        + linear_score(ytd_ret, -28, 35) * 0.07
+        + achievement_rank * 0.06
+    )
+
+    stock_position = asset_position(asset_df, "股票")
+    top_weight = np.nan
+    contribution = np.nan
+    up_ratio = np.nan
+    flow_score = 50.0
+    if holding_impact is not None and not holding_impact.empty:
+        if "占净值比例" in holding_impact.columns:
+            top_weight = numeric_series(holding_impact["占净值比例"]).dropna().sum()
+        if "估算贡献" in holding_impact.columns:
+            contribution = numeric_series(holding_impact["估算贡献"]).dropna().sum()
+        if "涨跌幅" in holding_impact.columns:
+            pct = numeric_series(holding_impact["涨跌幅"]).dropna()
+            if not pct.empty:
+                up_ratio = (pct > 0).mean() * 100
+        if "主力净流入-净额" in holding_impact.columns:
+            flow = numeric_series(holding_impact["主力净流入-净额"]).dropna()
+            if not flow.empty:
+                flow_score = linear_score(flow.sum(), -8e8, 8e8)
+    holding_score = clamp(
+        linear_score(contribution, -1.1, 1.2) * 0.38
+        + linear_score(up_ratio, 32, 70) * 0.22
+        + flow_score * 0.16
+        + linear_score(stock_position, 35, 92) * 0.12
+        + soft_ratio_score(top_weight, 28, 68, 5, 90) * 0.12
+    )
+
+    sector_score, sector_info = sector_heat_score(sector_df, sector_name)
+    peer_rank = percentile_score(daily_pct, open_fund_daily["日增长率"]) if open_fund_daily is not None and "日增长率" in open_fund_daily.columns else 50.0
+    peer_score = clamp(peer_rank * 0.36 + sector_score * 0.28 + achievement_rank * 0.22 + market_env.get("score", 50) * 0.14)
+
+    high60 = to_num(last.get("high60"))
+    space_to_high = (high60 / close - 1) * 100 if high60 and close else np.nan
+    nav_high120 = ind["close"].rolling(120, min_periods=20).max().iloc[-1] if has_nav and len(ind) >= 20 else np.nan
+    drawdown120 = abs((close / nav_high120 - 1) * 100) if pd.notna(nav_high120) and nav_high120 and close else np.nan
+    volatility20 = ind["pct"].tail(20).std() if has_nav and "pct" in ind.columns else np.nan
+    max_dd_1y = achievement_value(achievement_df, "近1年", "本产品最大回撒")
+    max_dd_3m = achievement_value(achievement_df, "近3月", "本产品最大回撒")
+    max_dd = max([v for v in [max_dd_1y, max_dd_3m] if pd.notna(v)], default=np.nan)
+    concentration_risk_score = linear_score(top_weight, 85, 35)
+    stock_position_risk_score = 100 - max(0, stock_position - 92) * 2 if pd.notna(stock_position) else 50
+    overheat_penalty_score = 100.0
+    if ret5 > 7:
+        overheat_penalty_score -= min(28, (ret5 - 7) * 4)
+    if ret10 > 12:
+        overheat_penalty_score -= min(24, (ret10 - 12) * 2.5)
+    if daily_pct > 3.5:
+        overheat_penalty_score -= min(18, (daily_pct - 3.5) * 5)
+    risk_score = clamp(
+        soft_ratio_score(space_to_high, 2, 16, -8, 35) * 0.18
+        + linear_score(drawdown120, 22, 3) * 0.20
+        + linear_score(volatility20, 4.2, 0.6) * 0.15
+        + linear_score(max_dd, 35, 8) * 0.20
+        + clamp(overheat_penalty_score) * 0.15
+        + concentration_risk_score * 0.07
+        + clamp(stock_position_risk_score) * 0.05
+    )
+
+    factor_scores = {
+        "趋势分": trend_score,
+        "净值动能分": momentum_score,
+        "持仓穿透分": holding_score,
+        "同类热度分": peer_score,
+        "风险控制分": risk_score,
+    }
+    total = (
+        trend_score * WEIGHTS["trend"]
+        + momentum_score * WEIGHTS["volume"]
+        + holding_score * WEIGHTS["funds"]
+        + peer_score * WEIGHTS["sector"]
+        + risk_score * WEIGHTS["risk"]
+    )
+
+    broken_ma20 = has_nav and close < to_num(last.get("ma20"))
+    broken_ma60 = has_nav and close < to_num(last.get("ma60"))
+    holding_drag = pd.notna(contribution) and contribution < -0.30 and (pd.isna(up_ratio) or up_ratio < 45)
+    overheat = ret5 > 8 and ret10 > 12 and risk_score < 55
+
+    if overheat:
+        action = "禁止追高"
+        action_tone = "risk"
+    elif broken_ma60 and (peer_score < 48 or holding_score < 45):
+        action = "离场"
+        action_tone = "risk"
+    elif broken_ma20 or holding_drag or drawdown120 > 12:
+        action = "减仓"
+        action_tone = "warn"
+    elif total >= 72 and trend_score >= 62 and momentum_score >= 55 and holding_score >= 50 and risk_score >= 48 and market_env.get("score", 50) >= 42:
+        action = "买入观察"
+        action_tone = "good"
+    elif total >= 58 and not broken_ma20 and not holding_drag:
+        action = "持有"
+        action_tone = "neutral"
+    else:
+        action = "观察等待"
+        action_tone = "neutral"
+
+    if market_env.get("score", 50) < 38 and action in {"买入观察", "持有"}:
+        action = f"{action}（轻仓）"
+        action_tone = "warn"
+
+    positives: list[str] = []
+    negatives: list[str] = []
+    if above_ma >= 3 and alignment >= 2:
+        positives.append("净值站上多条均线，趋势结构较完整")
+    elif broken_ma20:
+        negatives.append("净值跌破20日均线，短线趋势需要修复")
+    if momentum_score >= 65:
+        positives.append("近端净值动能和阶段业绩处于较强区间")
+    elif momentum_score < 45:
+        negatives.append("近端净值动能偏弱，阶段收益或同类排名缺少确认")
+    if pd.notna(contribution) and contribution > 0.15:
+        positives.append(f"前20重仓股实时估算贡献约 {contribution:.2f}%")
+    elif holding_drag:
+        negatives.append("重仓股实时拖累较明显，持仓穿透未确认")
+    if peer_rank >= 70 or sector_score >= 65:
+        positives.append("同类净值表现或映射板块热度处于前排")
+    elif peer_score < 45:
+        negatives.append("同类排名、板块热度或市场环境偏弱")
+    if risk_score >= 65:
+        positives.append("回撤、波动、集中度和短期过热约束仍可接受")
+    elif risk_score < 45:
+        negatives.append("位置或回撤风险偏高，宜等待净值回撤/修复确认")
+
+    return {
+        "price_df": price_df,
+        "factor_scores": factor_scores,
+        "total_score": clamp(total),
+        "action": action,
+        "action_tone": action_tone,
+        "sector_info": sector_info,
+        "sector_name": sector_name,
+        "market_env": market_env,
+        "positives": positives,
+        "negatives": negatives,
+        "raw": {
+            "daily_pct": daily_pct,
+            "ret5": ret5,
+            "ret10": ret10,
+            "ret20": ret20,
+            "month_ret": month_ret,
+            "quarter_ret": quarter_ret,
+            "ytd_ret": ytd_ret,
+            "peer_rank": peer_rank,
+            "achievement_rank": achievement_rank,
+            "stock_position": stock_position,
+            "top_weight": top_weight,
+            "holding_contribution": contribution,
+            "holding_up_ratio": up_ratio,
+            "space_to_high": space_to_high,
+            "drawdown120": drawdown120,
+            "volatility20": volatility20,
+            "max_drawdown": max_dd,
+        },
+    }
+
+
 def build_etf_leaderboard(spot_df: pd.DataFrame | None, limit: int = 30) -> pd.DataFrame:
     if spot_df is None or spot_df.empty:
         return pd.DataFrame()
@@ -1203,6 +1543,19 @@ def build_open_fund_watch_table(daily_df: pd.DataFrame | None, names_df: pd.Data
         for col in out.columns:
             if "单位净值" in col or "累计净值" in col or col in {"日增长值", "日增长率"}:
                 out[col] = numeric_series(out[col])
+        if "日增长率" in out.columns:
+            benchmark = daily_df["日增长率"] if daily_df is not None and "日增长率" in daily_df.columns else out["日增长率"]
+            out["场外机会分"] = out["日增长率"].map(lambda x: percentile_score(x, benchmark)).clip(0, 100)
+            out["盯盘提示"] = np.select(
+                [
+                    out["日增长率"] >= 3.5,
+                    out["日增长率"] <= -2.5,
+                    out["场外机会分"] >= 75,
+                    out["场外机会分"] <= 30,
+                ],
+                ["涨幅过快", "弱势回避", "强势观察", "同类偏弱"],
+                default="观察",
+            )
     return out
 
 
@@ -1216,7 +1569,10 @@ def format_open_fund_display(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["日增长值", "日增长率"]:
         if col in out:
             out[col] = out[col].map(lambda x: pct_text(x) if col == "日增长率" else (f"{x:.4f}" if pd.notna(x) else "-"))
+    if "场外机会分" in out:
+        out["场外机会分"] = out["场外机会分"].map(lambda x: f"{x:.1f}" if pd.notna(x) else "-")
     cols = ["基金代码", "基金简称", "基金类型", "日增长率", "申购状态", "赎回状态", "手续费"]
+    cols += ["场外机会分", "盯盘提示"]
     cols += [col for col in out.columns if ("单位净值" in col or "累计净值" in col) and col not in cols]
     return out[[col for col in cols if col in out.columns]]
 
@@ -1263,6 +1619,56 @@ def nav_trend_chart(nav_df: pd.DataFrame | None, title: str) -> go.Figure:
     return fig
 
 
+def otc_nav_analysis_chart(price_df: pd.DataFrame, title: str) -> go.Figure:
+    if price_df is None or price_df.empty:
+        return go.Figure()
+    df = add_indicators(price_df).tail(220).copy()
+    df["drawdown"] = df["close"] / df["close"].cummax() - 1
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        row_heights=[0.58, 0.20, 0.22],
+    )
+    fig.add_trace(go.Scatter(x=df["date"], y=df["close"], mode="lines", name="单位净值", line=dict(color="#1f77b4", width=2.2)), row=1, col=1)
+    for col, color in [("ma5", "#f0a202"), ("ma20", "#7b61ff"), ("ma60", "#4d4d4d")]:
+        if col in df:
+            fig.add_trace(go.Scatter(x=df["date"], y=df[col], mode="lines", name=col.upper(), line=dict(color=color, width=1.4)), row=1, col=1)
+    fig.add_trace(
+        go.Bar(
+            x=df["date"],
+            y=df["pct"],
+            name="单日涨跌%",
+            marker_color=np.where(df["pct"] >= 0, "#cf3f35", "#16845b"),
+        ),
+        row=2,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df["date"],
+            y=df["drawdown"] * 100,
+            mode="lines",
+            name="净值回撤%",
+            fill="tozeroy",
+            line=dict(color="#8a5a00", width=1.5),
+        ),
+        row=3,
+        col=1,
+    )
+    fig.update_layout(
+        title=title,
+        height=620,
+        margin=dict(l=20, r=20, t=45, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
+    )
+    fig.update_yaxes(title_text="净值", row=1, col=1)
+    fig.update_yaxes(title_text="涨跌%", row=2, col=1)
+    fig.update_yaxes(title_text="回撤%", row=3, col=1)
+    return fig
+
+
 def factor_bar(scores: dict[str, float]) -> go.Figure:
     df = pd.DataFrame({"维度": list(scores.keys()), "分数": [round(v, 1) for v in scores.values()]})
     fig = px.bar(df, x="分数", y="维度", orientation="h", text="分数", range_x=[0, 100], color="分数", color_continuous_scale=["#bd2d28", "#e4b751", "#2f8f5b"])
@@ -1271,11 +1677,11 @@ def factor_bar(scores: dict[str, float]) -> go.Figure:
     return fig
 
 
-def radar_chart(scores: dict[str, float]) -> go.Figure:
+def radar_chart(scores: dict[str, float], name: str = "ETF评分") -> go.Figure:
     labels = list(scores.keys())
     values = [round(v, 1) for v in scores.values()]
     fig = go.Figure()
-    fig.add_trace(go.Scatterpolar(r=values + values[:1], theta=labels + labels[:1], fill="toself", name="ETF评分", line_color="#1f77b4"))
+    fig.add_trace(go.Scatterpolar(r=values + values[:1], theta=labels + labels[:1], fill="toself", name=name, line_color="#1f77b4"))
     fig.update_layout(
         polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
         showlegend=False,
@@ -1569,6 +1975,21 @@ otc_watchlist_table = build_open_fund_watch_table(open_fund_daily, fund_names, o
 otc_row = latest_open_fund_row(open_fund_daily, otc_code)
 otc_name = str(otc_row.get("基金简称")) if otc_row is not None and "基金简称" in otc_row.index else otc_code
 otc_holding_impact, otc_estimated_contribution = build_holding_impact_table(otc_holdings_df, a_spot)
+otc_sector_name = infer_sector_name(otc_name, "", custom_sector, sector_df)
+otc_model = score_open_fund_model(
+    otc_nav_df,
+    index_df,
+    open_fund_daily,
+    otc_row,
+    otc_achievement_df,
+    otc_asset_df,
+    otc_holding_impact,
+    sector_df,
+    otc_sector_name,
+    market_env,
+)
+otc_factor_scores = otc_model["factor_scores"]
+otc_raw = otc_model["raw"]
 
 
 st.title("A股 ETF 短线机会评分台")
@@ -1748,39 +2169,58 @@ with tabs[5]:
 
 with tabs[6]:
     st.subheader(f"{otc_code} {otc_name}")
-    st.caption("场外基金没有交易所盘口，公开数据以净值、估值、持仓和阶段表现为主；重仓股穿透为估算，不等同于支付宝/微信账户收益。")
+    st.caption("场外基金没有交易所盘口，评分采用同一套多因子框架：趋势、净值动能、持仓穿透、同类热度和风险控制；重仓股穿透为估算，不等同于支付宝/微信账户收益。")
 
     otc_cols = st.columns(5)
+    otc_cols[0].metric("场外短线评分", f"{otc_model['total_score']:.1f}")
+    with otc_cols[1]:
+        st.markdown("状态")
+    st.markdown(score_badge(otc_model["action"], otc_model["action_tone"]), unsafe_allow_html=True)
     if otc_row is not None:
         nav_col = next((col for col in otc_row.index if "单位净值" in str(col)), None)
-        acc_col = next((col for col in otc_row.index if "累计净值" in str(col)), None)
-        otc_cols[0].metric("最新单位净值", f"{to_num(otc_row.get(nav_col)):.4f}" if nav_col else "-")
-        otc_cols[1].metric("日增长率", pct_text(to_num(otc_row.get("日增长率"))))
-        otc_cols[2].metric("申购状态", str(otc_row.get("申购状态", "-")))
-        otc_cols[3].metric("赎回状态", str(otc_row.get("赎回状态", "-")))
-        otc_cols[4].metric("手续费", str(otc_row.get("手续费", "-")))
+        otc_cols[2].metric("最新单位净值", f"{to_num(otc_row.get(nav_col)):.4f}" if nav_col else "-")
+        otc_cols[3].metric("日增长率", pct_text(to_num(otc_row.get("日增长率"))))
+        otc_cols[4].metric("同类日表现分位", pct_text(to_num(otc_raw.get("peer_rank")), 1))
     else:
-        otc_cols[0].metric("最新单位净值", "-")
-        otc_cols[1].metric("日增长率", "-")
-        otc_cols[2].metric("申购状态", "-")
-        otc_cols[3].metric("赎回状态", "-")
-        otc_cols[4].metric("手续费", "-")
+        otc_cols[2].metric("最新单位净值", "-")
+        otc_cols[3].metric("日增长率", "-")
+        otc_cols[4].metric("同类日表现分位", "-")
+
+    factor_left, factor_right = st.columns([1.15, 1])
+    with factor_left:
+        st.plotly_chart(factor_bar(otc_factor_scores), use_container_width=True)
+    with factor_right:
+        st.plotly_chart(radar_chart(otc_factor_scores, "场外基金评分"), use_container_width=True)
+
+    reason_left, reason_right = st.columns(2)
+    with reason_left:
+        st.markdown("**正向证据**")
+        if otc_model["positives"]:
+            for item in otc_model["positives"]:
+                st.write(f"- {item}")
+        else:
+            st.write("暂无明显正向确认。")
+    with reason_right:
+        st.markdown("**风险信号**")
+        if otc_model["negatives"]:
+            for item in otc_model["negatives"]:
+                st.write(f"- {item}")
+        else:
+            st.write("暂无明显负向信号。")
+
+    otc_detail_cols = st.columns(5)
+    otc_detail_cols[0].metric("近5日净值", pct_text(to_num(otc_raw.get("ret5"))))
+    otc_detail_cols[1].metric("近20日净值", pct_text(to_num(otc_raw.get("ret20"))))
+    otc_detail_cols[2].metric("重仓估算贡献", pct_text(to_num(otc_raw.get("holding_contribution"))))
+    otc_detail_cols[3].metric("前20持仓权重", pct_text(to_num(otc_raw.get("top_weight"))))
+    otc_detail_cols[4].metric("120日回撤", pct_text(to_num(otc_raw.get("drawdown120"))))
 
     left, right = st.columns([1.25, 1])
     with left:
-        st.plotly_chart(nav_trend_chart(otc_nav_df, f"{otc_code} {otc_name}：单位净值走势"), use_container_width=True)
-        st.subheader("场外基金自选池")
-        if otc_watchlist_table.empty:
-            st.info("场外基金自选池为空。可在左侧搜索后加入。")
+        if not otc_model["price_df"].empty:
+            st.plotly_chart(otc_nav_analysis_chart(otc_model["price_df"], f"{otc_code} {otc_name}：净值趋势 / 涨跌 / 回撤"), use_container_width=True)
         else:
-            st.dataframe(format_open_fund_display(otc_watchlist_table), use_container_width=True, hide_index=True)
-
-        st.subheader("开放式基金查询")
-        otc_browse_query = st.text_input("场外基金表内搜索", value="", placeholder="输入基金代码、名称、类型或拼音", key="otc_browse_query")
-        otc_browse_options = build_open_fund_search_options(open_fund_daily, fund_names, otc_browse_query, otc_code, limit=300)
-        browse_codes = [extract_code_from_label(item) for item in otc_browse_options]
-        otc_browse_table = build_open_fund_watch_table(open_fund_daily, fund_names, browse_codes)
-        st.dataframe(format_open_fund_display(otc_browse_table), use_container_width=True, hide_index=True)
+            st.plotly_chart(nav_trend_chart(otc_nav_df, f"{otc_code} {otc_name}：单位净值走势"), use_container_width=True)
 
     with right:
         st.subheader("资产配置")
@@ -1790,6 +2230,15 @@ with tabs[6]:
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.write("未取得资产配置。")
+
+        st.subheader("映射板块/市场")
+        sector_info = otc_model.get("sector_info", {})
+        if otc_sector_name and sector_info.get("sector") not in {"无板块数据", "未匹配具体行业"}:
+            st.metric("板块", otc_sector_name, delta=pct_text(to_num(sector_info.get("pct_chg"))))
+            st.write(f"成交额排名：{to_num(sector_info.get('rank_amount')):.0f} ｜ 资金排名：{to_num(sector_info.get('rank_flow')):.0f}")
+        else:
+            st.write(sector_info.get("note", "未映射到明确板块，按同类日表现和市场环境处理。"))
+        st.write(f"市场环境：{market_env['regime']} ｜ {market_env['breadth_label']}")
 
         st.subheader("基本信息")
         if otc_basic_df is not None and not otc_basic_df.empty:
@@ -1824,6 +2273,22 @@ with tabs[6]:
     else:
         st.write("未取得阶段业绩。")
 
+    st.divider()
+    watch_left, browse_right = st.columns([1, 1.15])
+    with watch_left:
+        st.subheader("场外基金自选池")
+        if otc_watchlist_table.empty:
+            st.info("场外基金自选池为空。可在左侧搜索后加入。")
+        else:
+            st.dataframe(format_open_fund_display(otc_watchlist_table), use_container_width=True, hide_index=True)
+    with browse_right:
+        st.subheader("开放式基金查询")
+        otc_browse_query = st.text_input("场外基金表内搜索", value="", placeholder="输入基金代码、名称、类型或拼音", key="otc_browse_query")
+        otc_browse_options = build_open_fund_search_options(open_fund_daily, fund_names, otc_browse_query, otc_code, limit=300)
+        browse_codes = [extract_code_from_label(item) for item in otc_browse_options]
+        otc_browse_table = build_open_fund_watch_table(open_fund_daily, fund_names, browse_codes)
+        st.dataframe(format_open_fund_display(otc_browse_table), use_container_width=True, hide_index=True)
+
 with tabs[7]:
     st.subheader("评分公式")
     st.code("ETF短线强度 = 趋势分*0.25 + 量能分*0.20 + 资金分*0.20 + 板块热度分*0.20 + 风险控制分*0.15", language="text")
@@ -1831,6 +2296,11 @@ with tabs[7]:
         "趋势分使用均线多头、突破位置和相对指数强弱；量能分使用今日成交额相对5日/20日均额和量价匹配；"
         "资金分使用主力净流入占比、ETF资金排名、MFI/OBV和近5日吸筹代理；板块热度分使用行业涨幅、成交额、净流入和上涨家数；"
         "风险控制分使用前高空间、20日回撤、折溢价、ATR和短期过热惩罚。"
+    )
+    st.code("场外基金短线强度 = 趋势分*0.25 + 净值动能分*0.20 + 持仓穿透分*0.20 + 同类热度分*0.20 + 风险控制分*0.15", language="text")
+    st.write(
+        "场外基金没有实时盘口和交易所成交额，因此使用公开净值、阶段业绩、重仓股实时穿透、同类基金日表现分位和映射板块热度做等价分析；"
+        "重点判断净值趋势是否成立、近端动能是否确认、重仓股是否拖累、同类/板块是否在前排，以及回撤和集中度是否可控。"
     )
     st.subheader("数据源状态")
     statuses = [
