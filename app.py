@@ -44,7 +44,9 @@ WEIGHTS = {
 
 APP_DIR = Path(__file__).resolve().parent
 WATCHLIST_FILE = APP_DIR / "watchlist.json"
+OTC_WATCHLIST_FILE = APP_DIR / "otc_watchlist.json"
 DEFAULT_WATCHLIST = ["510300", "159915", "512000", "588000", "512880", "159949"]
+DEFAULT_OTC_WATCHLIST = ["110022", "161725", "005827", "001071", "000001"]
 
 INDEX_OPTIONS = {
     "沪深300 sh000300": "sh000300",
@@ -155,6 +157,34 @@ def save_watchlist(codes: Any) -> list[str]:
     return normalized
 
 
+def load_otc_watchlist() -> list[str]:
+    if "otc_watchlist_codes" in st.session_state:
+        return normalize_code_list(st.session_state["otc_watchlist_codes"])
+    codes = DEFAULT_OTC_WATCHLIST
+    has_saved_file = False
+    try:
+        if OTC_WATCHLIST_FILE.exists():
+            has_saved_file = True
+            saved = json.loads(OTC_WATCHLIST_FILE.read_text(encoding="utf-8"))
+            codes = normalize_code_list(saved)
+    except (OSError, json.JSONDecodeError):
+        codes = DEFAULT_OTC_WATCHLIST
+    if not codes and not has_saved_file:
+        codes = DEFAULT_OTC_WATCHLIST
+    st.session_state["otc_watchlist_codes"] = codes
+    return codes
+
+
+def save_otc_watchlist(codes: Any) -> list[str]:
+    normalized = normalize_code_list(codes)
+    st.session_state["otc_watchlist_codes"] = normalized
+    try:
+        OTC_WATCHLIST_FILE.write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+    return normalized
+
+
 def market_symbol(code: str) -> str:
     return f"sh{code}" if code.startswith(("5", "6", "9")) else f"sz{code}"
 
@@ -245,6 +275,84 @@ def run_call(label: str, fn, *args, **kwargs) -> tuple[pd.DataFrame | None, dict
 @st.cache_data(ttl=60, show_spinner=False)
 def get_etf_spot() -> tuple[pd.DataFrame | None, dict[str, Any]]:
     return run_call("ETF实时行情-东方财富", ak.fund_etf_spot_em)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_open_fund_daily() -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    df, status = run_call("开放式基金净值-东方财富/天天基金", ak.fund_open_fund_daily_em)
+    if df is None:
+        return None, status
+    out = df.copy()
+    for col in ["日增长值", "日增长率"]:
+        if col in out.columns:
+            out[col] = numeric_series(out[col])
+    nav_cols = [col for col in out.columns if "单位净值" in col or "累计净值" in col]
+    for col in nav_cols:
+        out[col] = numeric_series(out[col])
+    return out, status
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_fund_names() -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    return run_call("全部基金名称-东方财富/天天基金", ak.fund_name_em)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_open_fund_nav_trend(code: str, indicator: str = "单位净值走势") -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    df, status = run_call(f"场外基金{indicator}", ak.fund_open_fund_info_em, symbol=code, indicator=indicator, period="成立来")
+    if df is None:
+        return None, status
+    out = df.copy()
+    date_col = "净值日期" if "净值日期" in out.columns else out.columns[0]
+    out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
+    for col in out.columns:
+        if col != date_col:
+            out[col] = numeric_series(out[col])
+    return out.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True), status
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_open_fund_basic(code: str) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    return run_call("场外基金基本信息-雪球", ak.fund_individual_basic_info_xq, symbol=code)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_open_fund_achievement(code: str) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    df, status = run_call("场外基金业绩-雪球", ak.fund_individual_achievement_xq, symbol=code)
+    if df is None:
+        return None, status
+    out = df.copy()
+    for col in ["本产品区间收益", "本产品最大回撒"]:
+        if col in out.columns:
+            out[col] = numeric_series(out[col])
+    return out, status
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_open_fund_asset_allocation(code: str) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    df, status = run_call("场外基金资产配置-雪球", ak.fund_individual_detail_hold_xq, symbol=code)
+    if df is None:
+        return None, status
+    out = df.copy()
+    if "仓位占比" in out.columns:
+        out["仓位占比"] = numeric_series(out["仓位占比"])
+    return out, status
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_open_fund_holdings(code: str) -> tuple[pd.DataFrame | None, list[dict[str, Any]]]:
+    statuses: list[dict[str, Any]] = []
+    current_year = date.today().year
+    for year in range(current_year, current_year - 4, -1):
+        df, status = run_call(f"场外基金股票持仓-{year}", ak.fund_portfolio_hold_em, symbol=code, date=str(year))
+        statuses.append(status)
+        if df is not None:
+            out = df.copy()
+            for col in ["占净值比例", "持股数", "持仓市值"]:
+                if col in out.columns:
+                    out[col] = numeric_series(out[col])
+            return out, statuses
+    return None, statuses
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -520,6 +628,82 @@ def etf_label_for_code(spot_df: pd.DataFrame | None, code: str) -> str:
     if row is not None:
         return etf_label_from_row(row)
     return f"{code} | 未取到实时名称"
+
+
+def fund_label_from_row(row: pd.Series | dict[str, Any]) -> str:
+    code = str(row.get("基金代码", "")).zfill(6)
+    name = str(row.get("基金简称", "-"))
+    fund_type = str(row.get("基金类型", ""))
+    pct = pct_text(to_num(row.get("日增长率")))
+    return " | ".join([part for part in [code, name, fund_type, pct] if part])
+
+
+def latest_open_fund_row(daily_df: pd.DataFrame | None, code: str) -> pd.Series | None:
+    if daily_df is None or daily_df.empty or "基金代码" not in daily_df.columns:
+        return None
+    hit = daily_df[daily_df["基金代码"].astype(str).str.zfill(6) == code]
+    return hit.iloc[0] if not hit.empty else None
+
+
+def open_fund_label_for_code(daily_df: pd.DataFrame | None, names_df: pd.DataFrame | None, code: str) -> str:
+    row = latest_open_fund_row(daily_df, code)
+    if row is not None:
+        return fund_label_from_row(row)
+    if names_df is not None and not names_df.empty and "基金代码" in names_df.columns:
+        hit = names_df[names_df["基金代码"].astype(str).str.zfill(6) == code]
+        if not hit.empty:
+            return fund_label_from_row(hit.iloc[0])
+    return f"{code} | 未取到基金名称"
+
+
+def build_open_fund_search_options(
+    daily_df: pd.DataFrame | None,
+    names_df: pd.DataFrame | None,
+    query: str,
+    current_code: str,
+    limit: int = 150,
+) -> list[str]:
+    current_code = clean_code(current_code)
+    if daily_df is None or daily_df.empty:
+        base = names_df.copy() if names_df is not None else pd.DataFrame()
+    else:
+        base = daily_df.copy()
+        if names_df is not None and not names_df.empty:
+            base["基金代码"] = base["基金代码"].astype(str).str.zfill(6)
+            names = names_df.copy()
+            names["基金代码"] = names["基金代码"].astype(str).str.zfill(6)
+            base = base.merge(names[["基金代码", "基金类型", "拼音缩写", "拼音全称"]], on="基金代码", how="left")
+
+    if base.empty or "基金代码" not in base.columns:
+        return [f"{current_code} | 场外基金列表不可用"]
+    base["基金代码"] = base["基金代码"].astype(str).str.zfill(6)
+    for col in ["基金简称", "基金类型", "拼音缩写", "拼音全称"]:
+        if col not in base.columns:
+            base[col] = ""
+    if "日增长率" in base.columns:
+        base["日增长率"] = numeric_series(base["日增长率"])
+
+    query = (query or "").strip()
+    if query:
+        mask = (
+            base["基金代码"].str.contains(query, case=False, na=False)
+            | base["基金简称"].astype(str).str.contains(query, case=False, na=False)
+            | base["基金类型"].astype(str).str.contains(query, case=False, na=False)
+            | base["拼音缩写"].astype(str).str.contains(query, case=False, na=False)
+            | base["拼音全称"].astype(str).str.contains(query, case=False, na=False)
+        )
+        filtered = base[mask].copy()
+        filtered["_rank"] = filtered["基金代码"].str.startswith(query).astype(int) * 3 + filtered["基金简称"].astype(str).str.contains(query, case=False, na=False).astype(int)
+        filtered = filtered.sort_values(["_rank", "日增长率"], ascending=[False, False], na_position="last")
+    else:
+        sort_col = "日增长率" if "日增长率" in base.columns else "基金代码"
+        filtered = base.sort_values(sort_col, ascending=False, na_position="last")
+
+    current = base[base["基金代码"] == current_code]
+    if not current.empty and current_code not in set(filtered["基金代码"].head(limit).tolist()):
+        filtered = pd.concat([current, filtered], ignore_index=True)
+    filtered = filtered.drop_duplicates("基金代码").head(limit)
+    return [fund_label_from_row(row) for _, row in filtered.iterrows()]
 
 
 def build_etf_search_options(
@@ -994,6 +1178,91 @@ def format_realtime_display(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def build_open_fund_watch_table(daily_df: pd.DataFrame | None, names_df: pd.DataFrame | None, codes: list[str]) -> pd.DataFrame:
+    codes = normalize_code_list(codes)
+    if not codes:
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    for code in codes:
+        row = latest_open_fund_row(daily_df, code)
+        payload = {"基金代码": code}
+        if row is not None:
+            payload.update(row.to_dict())
+        elif names_df is not None and not names_df.empty and "基金代码" in names_df.columns:
+            hit = names_df[names_df["基金代码"].astype(str).str.zfill(6) == code]
+            if not hit.empty:
+                payload.update(hit.iloc[0].to_dict())
+        rows.append(payload)
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out["基金代码"] = out["基金代码"].astype(str).str.zfill(6)
+        if names_df is not None and not names_df.empty and "基金类型" not in out.columns:
+            names = names_df.copy()
+            names["基金代码"] = names["基金代码"].astype(str).str.zfill(6)
+            out = out.merge(names[["基金代码", "基金类型"]], on="基金代码", how="left")
+        for col in out.columns:
+            if "单位净值" in col or "累计净值" in col or col in {"日增长值", "日增长率"}:
+                out[col] = numeric_series(out[col])
+    return out
+
+
+def format_open_fund_display(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    for col in out.columns:
+        if "单位净值" in col or "累计净值" in col:
+            out[col] = out[col].map(lambda x: f"{x:.4f}" if pd.notna(x) else "-")
+    for col in ["日增长值", "日增长率"]:
+        if col in out:
+            out[col] = out[col].map(lambda x: pct_text(x) if col == "日增长率" else (f"{x:.4f}" if pd.notna(x) else "-"))
+    cols = ["基金代码", "基金简称", "基金类型", "日增长率", "申购状态", "赎回状态", "手续费"]
+    cols += [col for col in out.columns if ("单位净值" in col or "累计净值" in col) and col not in cols]
+    return out[[col for col in cols if col in out.columns]]
+
+
+def build_holding_impact_table(holdings_df: pd.DataFrame | None, a_spot: pd.DataFrame | None) -> tuple[pd.DataFrame, float]:
+    if holdings_df is None or holdings_df.empty:
+        return pd.DataFrame(), np.nan
+    top = holdings_df.head(20).copy()
+    if "股票代码" not in top.columns:
+        return top, np.nan
+    top["股票代码"] = top["股票代码"].astype(str).str.zfill(6)
+    if "占净值比例" in top.columns:
+        top["占净值比例"] = numeric_series(top["占净值比例"])
+
+    if a_spot is not None and not a_spot.empty and "代码" in a_spot.columns and "涨跌幅" in a_spot.columns:
+        spot = a_spot.copy()
+        spot["股票代码"] = spot["代码"].astype(str).str.zfill(6)
+        keep_cols = ["股票代码", "最新价", "涨跌幅", "成交额", "主力净流入-净额"]
+        keep_cols = [col for col in keep_cols if col in spot.columns]
+        for col in ["最新价", "涨跌幅", "成交额", "主力净流入-净额"]:
+            if col in spot.columns:
+                spot[col] = numeric_series(spot[col])
+        top = top.merge(spot[keep_cols], on="股票代码", how="left")
+        if "占净值比例" in top.columns and "涨跌幅" in top.columns:
+            top["估算贡献"] = top["占净值比例"] * top["涨跌幅"] / 100
+            total = top["估算贡献"].dropna().sum()
+        else:
+            total = np.nan
+    else:
+        total = np.nan
+    return top, total
+
+
+def nav_trend_chart(nav_df: pd.DataFrame | None, title: str) -> go.Figure:
+    if nav_df is None or nav_df.empty:
+        return go.Figure()
+    df = nav_df.tail(520).copy()
+    date_col = "净值日期" if "净值日期" in df.columns else df.columns[0]
+    value_cols = [col for col in df.columns if col != date_col]
+    fig = go.Figure()
+    for col in value_cols[:2]:
+        fig.add_trace(go.Scatter(x=df[date_col], y=df[col], mode="lines", name=col, line=dict(width=2)))
+    fig.update_layout(title=title, height=360, margin=dict(l=20, r=20, t=45, b=20), legend=dict(orientation="h"))
+    return fig
+
+
 def factor_bar(scores: dict[str, float]) -> go.Figure:
     df = pd.DataFrame({"维度": list(scores.keys()), "分数": [round(v, 1) for v in scores.values()]})
     fig = px.bar(df, x="分数", y="维度", orientation="h", text="分数", range_x=[0, 100], color="分数", color_continuous_scale=["#bd2d28", "#e4b751", "#2f8f5b"])
@@ -1150,7 +1419,13 @@ else:
 
 if "selected_etf_code" not in st.session_state:
     st.session_state["selected_etf_code"] = "510300"
+if "selected_otc_code" not in st.session_state:
+    st.session_state["selected_otc_code"] = "110022"
 watchlist_codes = load_watchlist()
+otc_watchlist_codes = load_otc_watchlist()
+with st.spinner("正在读取场外基金列表..."):
+    open_fund_daily, open_fund_daily_status = get_open_fund_daily()
+    fund_names, fund_names_status = get_fund_names()
 
 
 with st.sidebar:
@@ -1198,6 +1473,41 @@ with st.sidebar:
             watchlist_codes = save_watchlist([])
             st.rerun()
 
+    st.subheader("场外基金查询")
+    otc_query = st.text_input("搜索场外基金", value="", placeholder="如 消费、白酒、110022、E方达")
+    current_otc_code = clean_code(st.session_state.get("selected_otc_code", "110022"))
+    otc_options = build_open_fund_search_options(open_fund_daily, fund_names, otc_query, current_otc_code)
+    otc_selected_index = 0
+    for idx, option in enumerate(otc_options):
+        if extract_code_from_label(option) == current_otc_code:
+            otc_selected_index = idx
+            break
+    otc_option = st.selectbox("场外基金列表", otc_options, index=otc_selected_index)
+    otc_manual_code = st.text_input("场外基金手动代码", value="", placeholder="可选：直接输入6位代码")
+    otc_code = clean_code(otc_manual_code) if maybe_clean_code(otc_manual_code) else (extract_code_from_label(otc_option) or current_otc_code)
+    st.session_state["selected_otc_code"] = otc_code
+
+    otc_add_col, otc_focus_col = st.columns(2)
+    with otc_add_col:
+        if st.button("加入场外自选", use_container_width=True):
+            otc_watchlist_codes = save_otc_watchlist([*otc_watchlist_codes, otc_code])
+            st.rerun()
+    with otc_focus_col:
+        if st.button("分析场外基金", use_container_width=True):
+            st.session_state["selected_otc_code"] = otc_code
+            st.rerun()
+
+    otc_watchlist_text = st.text_area("场外自选代码", value=" ".join(otc_watchlist_codes), height=60)
+    otc_save_col, otc_clear_col = st.columns(2)
+    with otc_save_col:
+        if st.button("保存场外自选", use_container_width=True):
+            otc_watchlist_codes = save_otc_watchlist(otc_watchlist_text)
+            st.rerun()
+    with otc_clear_col:
+        if st.button("清空场外自选", use_container_width=True):
+            otc_watchlist_codes = save_otc_watchlist([])
+            st.rerun()
+
     index_label = st.selectbox("对比指数", list(INDEX_OPTIONS.keys()), index=0)
     index_symbol = INDEX_OPTIONS[index_label]
     custom_sector = st.text_input("板块关键词", value="", placeholder="可选：如 证券、半导体、机器人")
@@ -1217,6 +1527,11 @@ with st.spinner("正在读取实时行情和K线..."):
     overview_df, overview_status = get_fund_overview(code)
     nav_df, nav_status = get_fund_nav(code, start_str, end_str)
     holdings_df, holdings_statuses = get_holdings(code)
+    otc_nav_df, otc_nav_status = get_open_fund_nav_trend(otc_code)
+    otc_basic_df, otc_basic_status = get_open_fund_basic(otc_code)
+    otc_achievement_df, otc_achievement_status = get_open_fund_achievement(otc_code)
+    otc_asset_df, otc_asset_status = get_open_fund_asset_allocation(otc_code)
+    otc_holdings_df, otc_holdings_statuses = get_open_fund_holdings(otc_code)
     if db_read_mode:
         sector_df, sector_status = get_sector_summary_from_db()
         if sector_df is None:
@@ -1250,6 +1565,10 @@ raw = model["raw"]
 factor_scores = model["factor_scores"]
 leaderboard = build_etf_leaderboard(etf_spot, leaderboard_size)
 watchlist_table = build_realtime_etf_table(etf_spot, codes=watchlist_codes)
+otc_watchlist_table = build_open_fund_watch_table(open_fund_daily, fund_names, otc_watchlist_codes)
+otc_row = latest_open_fund_row(open_fund_daily, otc_code)
+otc_name = str(otc_row.get("基金简称")) if otc_row is not None and "基金简称" in otc_row.index else otc_code
+otc_holding_impact, otc_estimated_contribution = build_holding_impact_table(otc_holdings_df, a_spot)
 
 
 st.title("A股 ETF 短线机会评分台")
@@ -1286,7 +1605,7 @@ metric_row2[0].metric("主力净额", format_money(main_amount), delta=pct_text(
 metric_row2[1].metric("量能倍数", f"{raw.get('amount_ratio5', np.nan):.2f}x", delta=f"20日 {raw.get('amount_ratio20', np.nan):.2f}x")
 metric_row2[2].metric("折溢价", pct_text(premium))
 
-tabs = st.tabs(["机会评分", "K线与量价", "资金与盘口", "板块与市场", "成分股", "自选池/查询", "模型"])
+tabs = st.tabs(["机会评分", "K线与量价", "资金与盘口", "板块与市场", "成分股", "自选池/查询", "场外基金", "模型"])
 
 with tabs[0]:
     left, right = st.columns([1.3, 1])
@@ -1428,6 +1747,84 @@ with tabs[5]:
         st.caption(f"当前展示 {len(browse_table)} 条结果。空搜索默认按实时机会分和成交额排序。")
 
 with tabs[6]:
+    st.subheader(f"{otc_code} {otc_name}")
+    st.caption("场外基金没有交易所盘口，公开数据以净值、估值、持仓和阶段表现为主；重仓股穿透为估算，不等同于支付宝/微信账户收益。")
+
+    otc_cols = st.columns(5)
+    if otc_row is not None:
+        nav_col = next((col for col in otc_row.index if "单位净值" in str(col)), None)
+        acc_col = next((col for col in otc_row.index if "累计净值" in str(col)), None)
+        otc_cols[0].metric("最新单位净值", f"{to_num(otc_row.get(nav_col)):.4f}" if nav_col else "-")
+        otc_cols[1].metric("日增长率", pct_text(to_num(otc_row.get("日增长率"))))
+        otc_cols[2].metric("申购状态", str(otc_row.get("申购状态", "-")))
+        otc_cols[3].metric("赎回状态", str(otc_row.get("赎回状态", "-")))
+        otc_cols[4].metric("手续费", str(otc_row.get("手续费", "-")))
+    else:
+        otc_cols[0].metric("最新单位净值", "-")
+        otc_cols[1].metric("日增长率", "-")
+        otc_cols[2].metric("申购状态", "-")
+        otc_cols[3].metric("赎回状态", "-")
+        otc_cols[4].metric("手续费", "-")
+
+    left, right = st.columns([1.25, 1])
+    with left:
+        st.plotly_chart(nav_trend_chart(otc_nav_df, f"{otc_code} {otc_name}：单位净值走势"), use_container_width=True)
+        st.subheader("场外基金自选池")
+        if otc_watchlist_table.empty:
+            st.info("场外基金自选池为空。可在左侧搜索后加入。")
+        else:
+            st.dataframe(format_open_fund_display(otc_watchlist_table), use_container_width=True, hide_index=True)
+
+        st.subheader("开放式基金查询")
+        otc_browse_query = st.text_input("场外基金表内搜索", value="", placeholder="输入基金代码、名称、类型或拼音", key="otc_browse_query")
+        otc_browse_options = build_open_fund_search_options(open_fund_daily, fund_names, otc_browse_query, otc_code, limit=300)
+        browse_codes = [extract_code_from_label(item) for item in otc_browse_options]
+        otc_browse_table = build_open_fund_watch_table(open_fund_daily, fund_names, browse_codes)
+        st.dataframe(format_open_fund_display(otc_browse_table), use_container_width=True, hide_index=True)
+
+    with right:
+        st.subheader("资产配置")
+        if otc_asset_df is not None and not otc_asset_df.empty:
+            fig = px.pie(otc_asset_df, names="资产类型", values="仓位占比", hole=0.45)
+            fig.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.write("未取得资产配置。")
+
+        st.subheader("基本信息")
+        if otc_basic_df is not None and not otc_basic_df.empty:
+            st.dataframe(otc_basic_df, use_container_width=True, hide_index=True)
+        else:
+            st.write("未取得基本信息。")
+
+    st.divider()
+    st.subheader("重仓股实时穿透")
+    impact_cols = st.columns(3)
+    impact_cols[0].metric("重仓股估算贡献", pct_text(otc_estimated_contribution))
+    if otc_holding_impact is not None and not otc_holding_impact.empty and "占净值比例" in otc_holding_impact:
+        impact_cols[1].metric("前20持仓权重", pct_text(otc_holding_impact["占净值比例"].dropna().sum()))
+    if otc_holding_impact is not None and not otc_holding_impact.empty and "涨跌幅" in otc_holding_impact:
+        impact_cols[2].metric("上涨重仓股数", f"{int((otc_holding_impact['涨跌幅'] > 0).sum())}")
+    if otc_holding_impact is not None and not otc_holding_impact.empty:
+        display_impact = otc_holding_impact.copy()
+        for col in ["占净值比例", "涨跌幅", "估算贡献"]:
+            if col in display_impact:
+                display_impact[col] = display_impact[col].map(lambda x: pct_text(x))
+        for col in ["成交额", "主力净流入-净额"]:
+            if col in display_impact:
+                display_impact[col] = display_impact[col].map(format_money)
+        keep_cols = ["股票代码", "股票名称", "占净值比例", "最新价", "涨跌幅", "估算贡献", "成交额", "主力净流入-净额", "季度"]
+        st.dataframe(display_impact[[col for col in keep_cols if col in display_impact.columns]], use_container_width=True, hide_index=True)
+    else:
+        st.write("未取得重仓股持仓。")
+
+    st.subheader("阶段业绩")
+    if otc_achievement_df is not None and not otc_achievement_df.empty:
+        st.dataframe(otc_achievement_df, use_container_width=True, hide_index=True)
+    else:
+        st.write("未取得阶段业绩。")
+
+with tabs[7]:
     st.subheader("评分公式")
     st.code("ETF短线强度 = 趋势分*0.25 + 量能分*0.20 + 资金分*0.20 + 板块热度分*0.20 + 风险控制分*0.15", language="text")
     st.write(
@@ -1436,7 +1833,23 @@ with tabs[6]:
         "风险控制分使用前高空间、20日回撤、折溢价、ATR和短期过热惩罚。"
     )
     st.subheader("数据源状态")
-    statuses = [spot_status, *daily_statuses, *index_statuses, overview_status, nav_status, *holdings_statuses, sector_status, a_spot_status]
+    statuses = [
+        spot_status,
+        open_fund_daily_status,
+        fund_names_status,
+        otc_nav_status,
+        otc_basic_status,
+        otc_achievement_status,
+        otc_asset_status,
+        *otc_holdings_statuses,
+        *daily_statuses,
+        *index_statuses,
+        overview_status,
+        nav_status,
+        *holdings_statuses,
+        sector_status,
+        a_spot_status,
+    ]
     status_df = pd.DataFrame([{"数据源": s.get("label"), "状态": "OK" if s.get("ok") else "FAIL", "说明": s.get("detail")} for s in statuses])
     st.dataframe(status_df, use_container_width=True, hide_index=True)
     st.subheader("数据库摘要")
