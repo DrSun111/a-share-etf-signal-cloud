@@ -1796,6 +1796,13 @@ st.markdown(
 
 with st.sidebar:
     st.header("数据库")
+    fund_mode = st.radio(
+        "分析类型",
+        ["场内ETF", "场外基金"],
+        index=0 if st.session_state.get("fund_mode", "场内ETF") == "场内ETF" else 1,
+        horizontal=True,
+    )
+    st.session_state["fund_mode"] = fund_mode
     db_read_mode = st.toggle("优先读取数据库快照", value=st.session_state.get("db_read_mode", False))
     st.session_state["db_read_mode"] = db_read_mode
     use_db_watchlist = st.toggle("自选池保存到数据库", value=st.session_state.get("use_db_watchlist", False))
@@ -1829,90 +1836,98 @@ if "selected_otc_code" not in st.session_state:
     st.session_state["selected_otc_code"] = "110022"
 watchlist_codes = load_watchlist()
 otc_watchlist_codes = load_otc_watchlist()
-with st.spinner("正在读取场外基金列表..."):
-    open_fund_daily, open_fund_daily_status = get_open_fund_daily()
-    fund_names, fund_names_status = get_fund_names()
+if fund_mode == "场外基金":
+    with st.spinner("正在读取场外基金列表..."):
+        open_fund_daily, open_fund_daily_status = get_open_fund_daily()
+        fund_names, fund_names_status = get_fund_names()
+else:
+    open_fund_daily, open_fund_daily_status = None, data_status("开放式基金净值-东方财富/天天基金", True, "场内模式未读取")
+    fund_names, fund_names_status = None, data_status("全部基金名称-东方财富/天天基金", True, "场内模式未读取")
 
 
 with st.sidebar:
     st.header("参数")
-    st.subheader("ETF实时查询")
-    search_query = st.text_input("搜索代码/名称/主题", value="", placeholder="如 510300、证券、机器人")
-    current_code = clean_code(st.session_state.get("selected_etf_code", "510300"))
-    search_options = build_etf_search_options(etf_spot, search_query, current_code)
-    selected_index = 0
-    for idx, option in enumerate(search_options):
-        if extract_code_from_label(option) == current_code:
-            selected_index = idx
-            break
-    selected_option = st.selectbox("ETF列表", search_options, index=selected_index)
-    selected_code = extract_code_from_label(selected_option) or current_code
-    manual_code = st.text_input("手动代码", value="", placeholder="可选：直接输入6位代码")
-    code = clean_code(manual_code) if maybe_clean_code(manual_code) else selected_code
-    st.session_state["selected_etf_code"] = code
+    code = clean_code(st.session_state.get("selected_etf_code", "510300"))
+    otc_code = clean_code(st.session_state.get("selected_otc_code", "110022"))
 
-    add_col, refresh_col = st.columns(2)
-    with add_col:
-        if st.button("加入自选", use_container_width=True):
-            watchlist_codes = save_watchlist([*watchlist_codes, code])
-            st.rerun()
-    with refresh_col:
-        if st.button("刷新行情", use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
+    if fund_mode == "场内ETF":
+        st.subheader("ETF实时查询")
+        search_query = st.text_input("搜索代码/名称/主题", value="", placeholder="如 510300、证券、机器人")
+        current_code = clean_code(st.session_state.get("selected_etf_code", "510300"))
+        search_options = build_etf_search_options(etf_spot, search_query, current_code)
+        selected_index = 0
+        for idx, option in enumerate(search_options):
+            if extract_code_from_label(option) == current_code:
+                selected_index = idx
+                break
+        selected_option = st.selectbox("ETF列表", search_options, index=selected_index)
+        selected_code = extract_code_from_label(selected_option) or current_code
+        manual_code = st.text_input("手动代码", value="", placeholder="可选：直接输入6位代码")
+        code = clean_code(manual_code) if maybe_clean_code(manual_code) else selected_code
+        st.session_state["selected_etf_code"] = code
 
-    st.subheader("基金自选池")
-    watchlist_label_options = [etf_label_for_code(etf_spot, item) for item in watchlist_codes]
-    if watchlist_label_options:
-        focus_label = st.selectbox("快速切换自选", watchlist_label_options)
-        if st.button("分析选中自选", use_container_width=True):
-            st.session_state["selected_etf_code"] = extract_code_from_label(focus_label) or code
-            st.rerun()
-    watchlist_text = st.text_area("批量编辑自选代码", value=" ".join(watchlist_codes), height=72, help="用空格、逗号或换行分隔代码。")
-    save_col, clear_col = st.columns(2)
-    with save_col:
-        if st.button("保存自选池", use_container_width=True):
-            watchlist_codes = save_watchlist(watchlist_text)
-            st.rerun()
-    with clear_col:
-        if st.button("清空自选", use_container_width=True):
-            watchlist_codes = save_watchlist([])
-            st.rerun()
+        add_col, refresh_col = st.columns(2)
+        with add_col:
+            if st.button("加入自选", use_container_width=True):
+                watchlist_codes = save_watchlist([*watchlist_codes, code])
+                st.rerun()
+        with refresh_col:
+            if st.button("刷新实时数据", use_container_width=True):
+                st.cache_data.clear()
+                st.rerun()
 
-    st.subheader("场外基金查询")
-    otc_query = st.text_input("搜索场外基金", value="", placeholder="如 消费、白酒、110022、E方达")
-    current_otc_code = clean_code(st.session_state.get("selected_otc_code", "110022"))
-    otc_options = build_open_fund_search_options(open_fund_daily, fund_names, otc_query, current_otc_code)
-    otc_selected_index = 0
-    for idx, option in enumerate(otc_options):
-        if extract_code_from_label(option) == current_otc_code:
-            otc_selected_index = idx
-            break
-    otc_option = st.selectbox("场外基金列表", otc_options, index=otc_selected_index)
-    otc_manual_code = st.text_input("场外基金手动代码", value="", placeholder="可选：直接输入6位代码")
-    otc_code = clean_code(otc_manual_code) if maybe_clean_code(otc_manual_code) else (extract_code_from_label(otc_option) or current_otc_code)
-    st.session_state["selected_otc_code"] = otc_code
+        st.subheader("场内自选池")
+        watchlist_label_options = [etf_label_for_code(etf_spot, item) for item in watchlist_codes]
+        if watchlist_label_options:
+            focus_label = st.selectbox("快速切换自选", watchlist_label_options)
+            if st.button("分析选中自选", use_container_width=True):
+                st.session_state["selected_etf_code"] = extract_code_from_label(focus_label) or code
+                st.rerun()
+        watchlist_text = st.text_area("批量编辑场内代码", value=" ".join(watchlist_codes), height=72, help="用空格、逗号或换行分隔代码。")
+        save_col, clear_col = st.columns(2)
+        with save_col:
+            if st.button("保存场内自选", use_container_width=True):
+                watchlist_codes = save_watchlist(watchlist_text)
+                st.rerun()
+        with clear_col:
+            if st.button("清空场内自选", use_container_width=True):
+                watchlist_codes = save_watchlist([])
+                st.rerun()
+    else:
+        st.subheader("场外基金查询")
+        otc_query = st.text_input("搜索场外基金", value="", placeholder="如 消费、白酒、110022、E方达")
+        current_otc_code = clean_code(st.session_state.get("selected_otc_code", "110022"))
+        otc_options = build_open_fund_search_options(open_fund_daily, fund_names, otc_query, current_otc_code)
+        otc_selected_index = 0
+        for idx, option in enumerate(otc_options):
+            if extract_code_from_label(option) == current_otc_code:
+                otc_selected_index = idx
+                break
+        otc_option = st.selectbox("场外基金列表", otc_options, index=otc_selected_index)
+        otc_manual_code = st.text_input("场外基金手动代码", value="", placeholder="可选：直接输入6位代码")
+        otc_code = clean_code(otc_manual_code) if maybe_clean_code(otc_manual_code) else (extract_code_from_label(otc_option) or current_otc_code)
+        st.session_state["selected_otc_code"] = otc_code
 
-    otc_add_col, otc_focus_col = st.columns(2)
-    with otc_add_col:
-        if st.button("加入场外自选", use_container_width=True):
-            otc_watchlist_codes = save_otc_watchlist([*otc_watchlist_codes, otc_code])
-            st.rerun()
-    with otc_focus_col:
-        if st.button("分析场外基金", use_container_width=True):
-            st.session_state["selected_otc_code"] = otc_code
-            st.rerun()
+        otc_add_col, otc_focus_col = st.columns(2)
+        with otc_add_col:
+            if st.button("加入场外自选", use_container_width=True):
+                otc_watchlist_codes = save_otc_watchlist([*otc_watchlist_codes, otc_code])
+                st.rerun()
+        with otc_focus_col:
+            if st.button("分析场外基金", use_container_width=True):
+                st.session_state["selected_otc_code"] = otc_code
+                st.rerun()
 
-    otc_watchlist_text = st.text_area("场外自选代码", value=" ".join(otc_watchlist_codes), height=60)
-    otc_save_col, otc_clear_col = st.columns(2)
-    with otc_save_col:
-        if st.button("保存场外自选", use_container_width=True):
-            otc_watchlist_codes = save_otc_watchlist(otc_watchlist_text)
-            st.rerun()
-    with otc_clear_col:
-        if st.button("清空场外自选", use_container_width=True):
-            otc_watchlist_codes = save_otc_watchlist([])
-            st.rerun()
+        otc_watchlist_text = st.text_area("场外自选代码", value=" ".join(otc_watchlist_codes), height=60)
+        otc_save_col, otc_clear_col = st.columns(2)
+        with otc_save_col:
+            if st.button("保存场外自选", use_container_width=True):
+                otc_watchlist_codes = save_otc_watchlist(otc_watchlist_text)
+                st.rerun()
+        with otc_clear_col:
+            if st.button("清空场外自选", use_container_width=True):
+                otc_watchlist_codes = save_otc_watchlist([])
+                st.rerun()
 
     index_label = st.selectbox("对比指数", list(INDEX_OPTIONS.keys()), index=0)
     index_symbol = INDEX_OPTIONS[index_label]
@@ -1927,17 +1942,28 @@ start_dt = end_dt - timedelta(days=int(lookback * 1.7))
 start_str = start_dt.strftime("%Y%m%d")
 end_str = end_dt.strftime("%Y%m%d")
 
-with st.spinner("正在读取实时行情和K线..."):
-    daily_df, daily_statuses = get_etf_daily(code, start_str, end_str)
+with st.spinner("正在读取实时数据..."):
     index_df, index_statuses = get_index_daily(index_symbol, start_str, end_str)
-    overview_df, overview_status = get_fund_overview(code)
-    nav_df, nav_status = get_fund_nav(code, start_str, end_str)
-    holdings_df, holdings_statuses = get_holdings(code)
-    otc_nav_df, otc_nav_status = get_open_fund_nav_trend(otc_code)
-    otc_basic_df, otc_basic_status = get_open_fund_basic(otc_code)
-    otc_achievement_df, otc_achievement_status = get_open_fund_achievement(otc_code)
-    otc_asset_df, otc_asset_status = get_open_fund_asset_allocation(otc_code)
-    otc_holdings_df, otc_holdings_statuses = get_open_fund_holdings(otc_code)
+    if fund_mode == "场内ETF":
+        daily_df, daily_statuses = get_etf_daily(code, start_str, end_str)
+        overview_df, overview_status = get_fund_overview(code)
+        nav_df, nav_status = get_fund_nav(code, start_str, end_str)
+        holdings_df, holdings_statuses = get_holdings(code)
+        otc_nav_df, otc_nav_status = None, data_status("场外基金净值", True, "场内模式未读取")
+        otc_basic_df, otc_basic_status = None, data_status("场外基金基本信息", True, "场内模式未读取")
+        otc_achievement_df, otc_achievement_status = None, data_status("场外基金业绩", True, "场内模式未读取")
+        otc_asset_df, otc_asset_status = None, data_status("场外基金资产配置", True, "场内模式未读取")
+        otc_holdings_df, otc_holdings_statuses = None, [data_status("场外基金股票持仓", True, "场内模式未读取")]
+    else:
+        daily_df, daily_statuses = None, [data_status("ETF日K", True, "场外模式未读取")]
+        overview_df, overview_status = None, data_status("ETF基金概况", True, "场外模式未读取")
+        nav_df, nav_status = None, data_status("ETF净值", True, "场外模式未读取")
+        holdings_df, holdings_statuses = None, [data_status("ETF成分持仓", True, "场外模式未读取")]
+        otc_nav_df, otc_nav_status = get_open_fund_nav_trend(otc_code)
+        otc_basic_df, otc_basic_status = get_open_fund_basic(otc_code)
+        otc_achievement_df, otc_achievement_status = get_open_fund_achievement(otc_code)
+        otc_asset_df, otc_asset_status = get_open_fund_asset_allocation(otc_code)
+        otc_holdings_df, otc_holdings_statuses = get_open_fund_holdings(otc_code)
     if db_read_mode:
         sector_df, sector_status = get_sector_summary_from_db()
         if sector_df is None:
@@ -1948,7 +1974,7 @@ with st.spinner("正在读取实时行情和K线..."):
     a_spot, a_spot_status = get_a_spot()
 
 
-if daily_df is None or daily_df.empty:
+if fund_mode == "场内ETF" and (daily_df is None or daily_df.empty):
     st.error("没有拿到该 ETF 的可用 K 线。请检查代码，或稍后再试数据源。")
     with st.expander("数据源状态"):
         for status in [spot_status, *daily_statuses, *index_statuses, overview_status, nav_status, *holdings_statuses, sector_status, a_spot_status]:
@@ -1958,19 +1984,34 @@ if daily_df is None or daily_df.empty:
     st.stop()
 
 
-daily_df = add_indicators(daily_df).tail(lookback).reset_index(drop=True)
+market_env = compute_market_env(index_df, a_spot, etf_spot)
 spot_row = latest_spot_row(etf_spot, code)
 overview = overview_fields(overview_df)
 etf_name = str(spot_row.get("名称")) if spot_row is not None and "名称" in spot_row.index else overview.get("基金简称", code)
 track_target = overview.get("跟踪标的", "")
 sector_name = infer_sector_name(etf_name, track_target, custom_sector, sector_df)
-market_env = compute_market_env(index_df, a_spot, etf_spot)
-model = score_model(daily_df, index_df, spot_row, etf_spot, sector_df, sector_name, market_env)
+if daily_df is not None and not daily_df.empty:
+    daily_df = add_indicators(daily_df).tail(lookback).reset_index(drop=True)
+    model = score_model(daily_df, index_df, spot_row, etf_spot, sector_df, sector_name, market_env)
+else:
+    daily_df = pd.DataFrame()
+    model = {
+        "latest": {"date": date.today(), "close": np.nan, "pct": np.nan},
+        "raw": {},
+        "factor_scores": {"趋势分": 50.0, "量能分": 50.0, "资金分": 50.0, "板块热度分": 50.0, "风险控制分": 50.0},
+        "total_score": 50.0,
+        "action": "数据不足",
+        "action_tone": "warn",
+        "positives": [],
+        "negatives": ["ETF K线数据不可用，场内评分暂按中性处理"],
+        "sector_info": {},
+    }
 latest = model["latest"]
 raw = model["raw"]
 factor_scores = model["factor_scores"]
 leaderboard = build_etf_leaderboard(etf_spot, leaderboard_size)
 watchlist_table = build_realtime_etf_table(etf_spot, codes=watchlist_codes)
+etf_holding_impact, etf_estimated_contribution = build_holding_impact_table(holdings_df, a_spot)
 otc_watchlist_table = build_open_fund_watch_table(open_fund_daily, fund_names, otc_watchlist_codes)
 otc_row = latest_open_fund_row(open_fund_daily, otc_code)
 otc_name = str(otc_row.get("基金简称")) if otc_row is not None and "基金简称" in otc_row.index else otc_code
@@ -1992,8 +2033,160 @@ otc_factor_scores = otc_model["factor_scores"]
 otc_raw = otc_model["raw"]
 
 
-st.title("A股 ETF 短线机会评分台")
-st.caption("多维度评分用于辅助盯盘和风控，不构成投资建议；实盘需结合账户风险承受能力、交易成本、滑点和数据延迟。")
+if fund_mode == "场外基金":
+    st.title("A股场外基金短线机会评分台")
+    st.caption("场外基金页只显示开放式基金体系：净值趋势、阶段业绩、公开持仓穿透、同类热度和风险控制。公开数据不包含支付宝/微信账户持仓。")
+
+    title_left, title_mid, title_right = st.columns([2.2, 1.1, 1.2])
+    with title_left:
+        st.subheader(f"{otc_code}  {otc_name}")
+        nav_date = "-"
+        if otc_model["price_df"] is not None and not otc_model["price_df"].empty:
+            nav_date = pd.to_datetime(otc_model["price_df"]["date"].iloc[-1]).date()
+        st.markdown(f"<span class='small-note'>最新净值日：{nav_date} ｜ 市场环境：{market_env['regime']}</span>", unsafe_allow_html=True)
+    with title_mid:
+        st.metric("场外短线评分", f"{otc_model['total_score']:.1f}", help="趋势25%、净值动能20%、持仓穿透20%、同类热度20%、风险15%")
+    with title_right:
+        st.markdown("状态")
+        st.markdown(score_badge(otc_model["action"], otc_model["action_tone"]), unsafe_allow_html=True)
+
+    otc_header_cols = st.columns(5)
+    if otc_row is not None:
+        nav_col = next((col for col in otc_row.index if "单位净值" in str(col)), None)
+        otc_header_cols[0].metric("最新单位净值", f"{to_num(otc_row.get(nav_col)):.4f}" if nav_col else "-")
+        otc_header_cols[1].metric("日增长率", pct_text(to_num(otc_row.get("日增长率"))))
+        otc_header_cols[2].metric("同类日表现分位", pct_text(to_num(otc_raw.get("peer_rank")), 1))
+        otc_header_cols[3].metric("申购状态", str(otc_row.get("申购状态", "-")))
+        otc_header_cols[4].metric("赎回状态", str(otc_row.get("赎回状态", "-")))
+    else:
+        for col, label in zip(otc_header_cols, ["最新单位净值", "日增长率", "同类日表现分位", "申购状态", "赎回状态"]):
+            col.metric(label, "-")
+
+    otc_tabs = st.tabs(["机会评分", "净值趋势", "持仓穿透", "自选池/查询", "模型"])
+
+    with otc_tabs[0]:
+        factor_left, factor_right = st.columns([1.15, 1])
+        with factor_left:
+            st.plotly_chart(factor_bar(otc_factor_scores), use_container_width=True)
+        with factor_right:
+            st.plotly_chart(radar_chart(otc_factor_scores, "场外基金评分"), use_container_width=True)
+
+        reason_left, reason_right = st.columns(2)
+        with reason_left:
+            st.markdown("**正向证据**")
+            if otc_model["positives"]:
+                for item in otc_model["positives"]:
+                    st.write(f"- {item}")
+            else:
+                st.write("暂无明显正向确认。")
+        with reason_right:
+            st.markdown("**风险信号**")
+            if otc_model["negatives"]:
+                for item in otc_model["negatives"]:
+                    st.write(f"- {item}")
+            else:
+                st.write("暂无明显负向信号。")
+
+        otc_detail_cols = st.columns(5)
+        otc_detail_cols[0].metric("近5日净值", pct_text(to_num(otc_raw.get("ret5"))))
+        otc_detail_cols[1].metric("近20日净值", pct_text(to_num(otc_raw.get("ret20"))))
+        otc_detail_cols[2].metric("重仓估算贡献", pct_text(to_num(otc_raw.get("holding_contribution"))))
+        otc_detail_cols[3].metric("前20持仓权重", pct_text(to_num(otc_raw.get("top_weight"))))
+        otc_detail_cols[4].metric("120日回撤", pct_text(to_num(otc_raw.get("drawdown120"))))
+
+    with otc_tabs[1]:
+        left, right = st.columns([1.25, 1])
+        with left:
+            if not otc_model["price_df"].empty:
+                st.plotly_chart(otc_nav_analysis_chart(otc_model["price_df"], f"{otc_code} {otc_name}：净值趋势 / 涨跌 / 回撤"), use_container_width=True)
+            else:
+                st.plotly_chart(nav_trend_chart(otc_nav_df, f"{otc_code} {otc_name}：单位净值走势"), use_container_width=True)
+        with right:
+            st.subheader("资产配置")
+            if otc_asset_df is not None and not otc_asset_df.empty:
+                fig = px.pie(otc_asset_df, names="资产类型", values="仓位占比", hole=0.45)
+                fig.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.write("未取得资产配置。")
+
+            st.subheader("映射板块/市场")
+            sector_info = otc_model.get("sector_info", {})
+            if otc_sector_name and sector_info.get("sector") not in {"无板块数据", "未匹配具体行业"}:
+                st.metric("板块", otc_sector_name, delta=pct_text(to_num(sector_info.get("pct_chg"))))
+                st.write(f"成交额排名：{to_num(sector_info.get('rank_amount')):.0f} ｜ 资金排名：{to_num(sector_info.get('rank_flow')):.0f}")
+            else:
+                st.write(sector_info.get("note", "未映射到明确板块，按同类日表现和市场环境处理。"))
+            st.write(f"市场环境：{market_env['regime']} ｜ {market_env['breadth_label']}")
+
+            st.subheader("基本信息")
+            if otc_basic_df is not None and not otc_basic_df.empty:
+                st.dataframe(otc_basic_df, use_container_width=True, hide_index=True)
+            else:
+                st.write("未取得基本信息。")
+
+    with otc_tabs[2]:
+        st.subheader("重仓股实时穿透")
+        impact_cols = st.columns(4)
+        impact_cols[0].metric("重仓股估算贡献", pct_text(otc_estimated_contribution))
+        if otc_holding_impact is not None and not otc_holding_impact.empty and "占净值比例" in otc_holding_impact:
+            impact_cols[1].metric("前20持仓权重", pct_text(otc_holding_impact["占净值比例"].dropna().sum()))
+        if otc_holding_impact is not None and not otc_holding_impact.empty and "涨跌幅" in otc_holding_impact:
+            impact_cols[2].metric("上涨重仓股数", f"{int((otc_holding_impact['涨跌幅'] > 0).sum())}")
+        if otc_holding_impact is not None and not otc_holding_impact.empty and "主力净流入-净额" in otc_holding_impact:
+            impact_cols[3].metric("重仓主力净额", format_money(numeric_series(otc_holding_impact["主力净流入-净额"]).sum()))
+        if otc_holding_impact is not None and not otc_holding_impact.empty:
+            display_impact = otc_holding_impact.copy()
+            for col in ["占净值比例", "涨跌幅", "估算贡献"]:
+                if col in display_impact:
+                    display_impact[col] = display_impact[col].map(lambda x: pct_text(x))
+            for col in ["成交额", "主力净流入-净额"]:
+                if col in display_impact:
+                    display_impact[col] = display_impact[col].map(format_money)
+            keep_cols = ["股票代码", "股票名称", "占净值比例", "最新价", "涨跌幅", "估算贡献", "成交额", "主力净流入-净额", "季度"]
+            st.dataframe(display_impact[[col for col in keep_cols if col in display_impact.columns]], use_container_width=True, hide_index=True)
+        else:
+            st.write("未取得重仓股持仓。")
+
+        st.subheader("阶段业绩")
+        if otc_achievement_df is not None and not otc_achievement_df.empty:
+            st.dataframe(otc_achievement_df, use_container_width=True, hide_index=True)
+        else:
+            st.write("未取得阶段业绩。")
+
+    with otc_tabs[3]:
+        watch_left, browse_right = st.columns([1, 1.15])
+        with watch_left:
+            st.subheader("场外基金自选池")
+            if otc_watchlist_table.empty:
+                st.info("场外基金自选池为空。可在左侧搜索后加入。")
+            else:
+                st.dataframe(format_open_fund_display(otc_watchlist_table), use_container_width=True, hide_index=True)
+        with browse_right:
+            st.subheader("开放式基金查询")
+            otc_browse_query = st.text_input("场外基金表内搜索", value="", placeholder="输入基金代码、名称、类型或拼音", key="otc_browse_query")
+            otc_browse_options = build_open_fund_search_options(open_fund_daily, fund_names, otc_browse_query, otc_code, limit=300)
+            browse_codes = [extract_code_from_label(item) for item in otc_browse_options]
+            otc_browse_table = build_open_fund_watch_table(open_fund_daily, fund_names, browse_codes)
+            st.dataframe(format_open_fund_display(otc_browse_table), use_container_width=True, hide_index=True)
+
+    with otc_tabs[4]:
+        st.subheader("场外基金评分公式")
+        st.code("场外基金短线强度 = 趋势分*0.25 + 净值动能分*0.20 + 持仓穿透分*0.20 + 同类热度分*0.20 + 风险控制分*0.15", language="text")
+        st.write(
+            "减仓：净值跌破20日线，或重仓股估算贡献小于 -0.30% 且上涨重仓股比例偏低，或120日回撤超过12%。"
+            "离场：净值跌破60日线，并且同类热度分低于48或持仓穿透分低于45。"
+        )
+        st.subheader("数据源状态")
+        statuses = [open_fund_daily_status, fund_names_status, otc_nav_status, otc_basic_status, otc_achievement_status, otc_asset_status, *otc_holdings_statuses, *index_statuses, sector_status, a_spot_status]
+        status_df = pd.DataFrame([{"数据源": s.get("label"), "状态": "OK" if s.get("ok") else "FAIL", "说明": s.get("detail")} for s in statuses])
+        st.dataframe(status_df, use_container_width=True, hide_index=True)
+
+    st.stop()
+
+
+st.title("A股场内 ETF 短线机会评分台")
+st.caption("场内 ETF 页只显示交易所基金体系：实时行情、K线量价、主力资金、盘口、行业热度、成分股实时穿透和场内自选池。")
 
 title_left, title_mid, title_right = st.columns([2.2, 1.1, 1.2])
 with title_left:
@@ -2026,7 +2219,7 @@ metric_row2[0].metric("主力净额", format_money(main_amount), delta=pct_text(
 metric_row2[1].metric("量能倍数", f"{raw.get('amount_ratio5', np.nan):.2f}x", delta=f"20日 {raw.get('amount_ratio20', np.nan):.2f}x")
 metric_row2[2].metric("折溢价", pct_text(premium))
 
-tabs = st.tabs(["机会评分", "K线与量价", "资金与盘口", "板块与市场", "成分股", "自选池/查询", "场外基金", "模型"])
+tabs = st.tabs(["机会评分", "K线与量价", "资金与盘口", "板块与市场", "成分股穿透", "自选池/查询", "模型"])
 
 with tabs[0]:
     left, right = st.columns([1.3, 1])
@@ -2113,16 +2306,40 @@ with tabs[4]:
         focus = overview_display[overview_display["项目"].isin(["基金全称", "基金类型", "基金管理人", "净资产规模", "份额规模", "管理费率", "托管费率", "跟踪标的"])]
         st.dataframe(focus if not focus.empty else overview_display, use_container_width=True, hide_index=True)
     with right:
-        st.subheader("前十大成分股")
-        if holdings_df is not None and not holdings_df.empty:
-            latest_quarter = holdings_df["季度"].iloc[0] if "季度" in holdings_df.columns else ""
-            top_hold = holdings_df.head(10).copy()
-            if "占净值比例" in top_hold:
-                fig = px.bar(top_hold.sort_values("占净值比例"), x="占净值比例", y="股票名称", orientation="h", labels={"占净值比例": "占净值比例%", "股票名称": ""})
-                fig.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10))
+        st.subheader("成分股实时穿透")
+        impact_cols = st.columns(4)
+        impact_cols[0].metric("估算贡献", pct_text(etf_estimated_contribution))
+        if etf_holding_impact is not None and not etf_holding_impact.empty and "占净值比例" in etf_holding_impact:
+            impact_cols[1].metric("前20权重", pct_text(etf_holding_impact["占净值比例"].dropna().sum()))
+        if etf_holding_impact is not None and not etf_holding_impact.empty and "涨跌幅" in etf_holding_impact:
+            impact_cols[2].metric("上涨数量", f"{int((etf_holding_impact['涨跌幅'] > 0).sum())}")
+        if etf_holding_impact is not None and not etf_holding_impact.empty and "主力净流入-净额" in etf_holding_impact:
+            impact_cols[3].metric("主力净额", format_money(numeric_series(etf_holding_impact["主力净流入-净额"]).sum()))
+
+        if etf_holding_impact is not None and not etf_holding_impact.empty:
+            latest_quarter = etf_holding_impact["季度"].iloc[0] if "季度" in etf_holding_impact.columns else ""
+            if "占净值比例" in etf_holding_impact:
+                fig = px.bar(
+                    etf_holding_impact.head(20).sort_values("占净值比例"),
+                    x="占净值比例",
+                    y="股票名称",
+                    orientation="h",
+                    color="涨跌幅" if "涨跌幅" in etf_holding_impact else None,
+                    color_continuous_scale=["#16845b", "#f3d17c", "#cf3f35"],
+                    labels={"占净值比例": "占净值比例%", "股票名称": "", "涨跌幅": "实时涨跌%"},
+                )
+                fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10))
                 st.plotly_chart(fig, use_container_width=True)
-            st.caption(str(latest_quarter))
-            st.dataframe(top_hold, use_container_width=True, hide_index=True)
+            display_impact = etf_holding_impact.copy()
+            for col in ["占净值比例", "涨跌幅", "估算贡献"]:
+                if col in display_impact:
+                    display_impact[col] = display_impact[col].map(lambda x: pct_text(x))
+            for col in ["成交额", "主力净流入-净额"]:
+                if col in display_impact:
+                    display_impact[col] = display_impact[col].map(format_money)
+            keep_cols = ["股票代码", "股票名称", "占净值比例", "最新价", "涨跌幅", "估算贡献", "成交额", "主力净流入-净额", "季度"]
+            st.caption(f"公开持仓期：{latest_quarter}；实时涨跌来自 A 股行情，估算贡献=持仓权重×个股实时涨跌幅。")
+            st.dataframe(display_impact[[col for col in keep_cols if col in display_impact.columns]], use_container_width=True, hide_index=True)
         else:
             st.write("未取得持仓数据。")
 
@@ -2168,158 +2385,22 @@ with tabs[5]:
         st.caption(f"当前展示 {len(browse_table)} 条结果。空搜索默认按实时机会分和成交额排序。")
 
 with tabs[6]:
-    st.subheader(f"{otc_code} {otc_name}")
-    st.caption("场外基金没有交易所盘口，评分采用同一套多因子框架：趋势、净值动能、持仓穿透、同类热度和风险控制；重仓股穿透为估算，不等同于支付宝/微信账户收益。")
-
-    otc_cols = st.columns(5)
-    otc_cols[0].metric("场外短线评分", f"{otc_model['total_score']:.1f}")
-    with otc_cols[1]:
-        st.markdown("状态")
-    st.markdown(score_badge(otc_model["action"], otc_model["action_tone"]), unsafe_allow_html=True)
-    if otc_row is not None:
-        nav_col = next((col for col in otc_row.index if "单位净值" in str(col)), None)
-        otc_cols[2].metric("最新单位净值", f"{to_num(otc_row.get(nav_col)):.4f}" if nav_col else "-")
-        otc_cols[3].metric("日增长率", pct_text(to_num(otc_row.get("日增长率"))))
-        otc_cols[4].metric("同类日表现分位", pct_text(to_num(otc_raw.get("peer_rank")), 1))
-    else:
-        otc_cols[2].metric("最新单位净值", "-")
-        otc_cols[3].metric("日增长率", "-")
-        otc_cols[4].metric("同类日表现分位", "-")
-
-    factor_left, factor_right = st.columns([1.15, 1])
-    with factor_left:
-        st.plotly_chart(factor_bar(otc_factor_scores), use_container_width=True)
-    with factor_right:
-        st.plotly_chart(radar_chart(otc_factor_scores, "场外基金评分"), use_container_width=True)
-
-    reason_left, reason_right = st.columns(2)
-    with reason_left:
-        st.markdown("**正向证据**")
-        if otc_model["positives"]:
-            for item in otc_model["positives"]:
-                st.write(f"- {item}")
-        else:
-            st.write("暂无明显正向确认。")
-    with reason_right:
-        st.markdown("**风险信号**")
-        if otc_model["negatives"]:
-            for item in otc_model["negatives"]:
-                st.write(f"- {item}")
-        else:
-            st.write("暂无明显负向信号。")
-
-    otc_detail_cols = st.columns(5)
-    otc_detail_cols[0].metric("近5日净值", pct_text(to_num(otc_raw.get("ret5"))))
-    otc_detail_cols[1].metric("近20日净值", pct_text(to_num(otc_raw.get("ret20"))))
-    otc_detail_cols[2].metric("重仓估算贡献", pct_text(to_num(otc_raw.get("holding_contribution"))))
-    otc_detail_cols[3].metric("前20持仓权重", pct_text(to_num(otc_raw.get("top_weight"))))
-    otc_detail_cols[4].metric("120日回撤", pct_text(to_num(otc_raw.get("drawdown120"))))
-
-    left, right = st.columns([1.25, 1])
-    with left:
-        if not otc_model["price_df"].empty:
-            st.plotly_chart(otc_nav_analysis_chart(otc_model["price_df"], f"{otc_code} {otc_name}：净值趋势 / 涨跌 / 回撤"), use_container_width=True)
-        else:
-            st.plotly_chart(nav_trend_chart(otc_nav_df, f"{otc_code} {otc_name}：单位净值走势"), use_container_width=True)
-
-    with right:
-        st.subheader("资产配置")
-        if otc_asset_df is not None and not otc_asset_df.empty:
-            fig = px.pie(otc_asset_df, names="资产类型", values="仓位占比", hole=0.45)
-            fig.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.write("未取得资产配置。")
-
-        st.subheader("映射板块/市场")
-        sector_info = otc_model.get("sector_info", {})
-        if otc_sector_name and sector_info.get("sector") not in {"无板块数据", "未匹配具体行业"}:
-            st.metric("板块", otc_sector_name, delta=pct_text(to_num(sector_info.get("pct_chg"))))
-            st.write(f"成交额排名：{to_num(sector_info.get('rank_amount')):.0f} ｜ 资金排名：{to_num(sector_info.get('rank_flow')):.0f}")
-        else:
-            st.write(sector_info.get("note", "未映射到明确板块，按同类日表现和市场环境处理。"))
-        st.write(f"市场环境：{market_env['regime']} ｜ {market_env['breadth_label']}")
-
-        st.subheader("基本信息")
-        if otc_basic_df is not None and not otc_basic_df.empty:
-            st.dataframe(otc_basic_df, use_container_width=True, hide_index=True)
-        else:
-            st.write("未取得基本信息。")
-
-    st.divider()
-    st.subheader("重仓股实时穿透")
-    impact_cols = st.columns(3)
-    impact_cols[0].metric("重仓股估算贡献", pct_text(otc_estimated_contribution))
-    if otc_holding_impact is not None and not otc_holding_impact.empty and "占净值比例" in otc_holding_impact:
-        impact_cols[1].metric("前20持仓权重", pct_text(otc_holding_impact["占净值比例"].dropna().sum()))
-    if otc_holding_impact is not None and not otc_holding_impact.empty and "涨跌幅" in otc_holding_impact:
-        impact_cols[2].metric("上涨重仓股数", f"{int((otc_holding_impact['涨跌幅'] > 0).sum())}")
-    if otc_holding_impact is not None and not otc_holding_impact.empty:
-        display_impact = otc_holding_impact.copy()
-        for col in ["占净值比例", "涨跌幅", "估算贡献"]:
-            if col in display_impact:
-                display_impact[col] = display_impact[col].map(lambda x: pct_text(x))
-        for col in ["成交额", "主力净流入-净额"]:
-            if col in display_impact:
-                display_impact[col] = display_impact[col].map(format_money)
-        keep_cols = ["股票代码", "股票名称", "占净值比例", "最新价", "涨跌幅", "估算贡献", "成交额", "主力净流入-净额", "季度"]
-        st.dataframe(display_impact[[col for col in keep_cols if col in display_impact.columns]], use_container_width=True, hide_index=True)
-    else:
-        st.write("未取得重仓股持仓。")
-
-    st.subheader("阶段业绩")
-    if otc_achievement_df is not None and not otc_achievement_df.empty:
-        st.dataframe(otc_achievement_df, use_container_width=True, hide_index=True)
-    else:
-        st.write("未取得阶段业绩。")
-
-    st.divider()
-    watch_left, browse_right = st.columns([1, 1.15])
-    with watch_left:
-        st.subheader("场外基金自选池")
-        if otc_watchlist_table.empty:
-            st.info("场外基金自选池为空。可在左侧搜索后加入。")
-        else:
-            st.dataframe(format_open_fund_display(otc_watchlist_table), use_container_width=True, hide_index=True)
-    with browse_right:
-        st.subheader("开放式基金查询")
-        otc_browse_query = st.text_input("场外基金表内搜索", value="", placeholder="输入基金代码、名称、类型或拼音", key="otc_browse_query")
-        otc_browse_options = build_open_fund_search_options(open_fund_daily, fund_names, otc_browse_query, otc_code, limit=300)
-        browse_codes = [extract_code_from_label(item) for item in otc_browse_options]
-        otc_browse_table = build_open_fund_watch_table(open_fund_daily, fund_names, browse_codes)
-        st.dataframe(format_open_fund_display(otc_browse_table), use_container_width=True, hide_index=True)
-
-with tabs[7]:
-    st.subheader("评分公式")
+    st.subheader("场内 ETF 评分公式")
     st.code("ETF短线强度 = 趋势分*0.25 + 量能分*0.20 + 资金分*0.20 + 板块热度分*0.20 + 风险控制分*0.15", language="text")
     st.write(
         "趋势分使用均线多头、突破位置和相对指数强弱；量能分使用今日成交额相对5日/20日均额和量价匹配；"
         "资金分使用主力净流入占比、ETF资金排名、MFI/OBV和近5日吸筹代理；板块热度分使用行业涨幅、成交额、净流入和上涨家数；"
         "风险控制分使用前高空间、20日回撤、折溢价、ATR和短期过热惩罚。"
     )
-    st.code("场外基金短线强度 = 趋势分*0.25 + 净值动能分*0.20 + 持仓穿透分*0.20 + 同类热度分*0.20 + 风险控制分*0.15", language="text")
-    st.write(
-        "场外基金没有实时盘口和交易所成交额，因此使用公开净值、阶段业绩、重仓股实时穿透、同类基金日表现分位和映射板块热度做等价分析；"
-        "重点判断净值趋势是否成立、近端动能是否确认、重仓股是否拖累、同类/板块是否在前排，以及回撤和集中度是否可控。"
-    )
+    st.subheader("动作指示逻辑")
+    st.write("禁止追高：近5日涨幅超过10%，5日量能倍数超过2.0，同时折溢价绝对值超过0.45%，且风险控制分低于55。")
+    st.write("离场：价格跌破20日线，并且板块热度分低于48或资金分低于45。")
+    st.write("减仓：高位放量滞涨，或价格跌破10日线且主力净流出。")
+    st.write("买入观察：总分不低于72，趋势、量能、资金和风险均达到最低确认，且市场环境分不低于42。")
+    st.write("持有：总分不低于58，未跌破20日线，且未出现明显主力流出。")
+
     st.subheader("数据源状态")
-    statuses = [
-        spot_status,
-        open_fund_daily_status,
-        fund_names_status,
-        otc_nav_status,
-        otc_basic_status,
-        otc_achievement_status,
-        otc_asset_status,
-        *otc_holdings_statuses,
-        *daily_statuses,
-        *index_statuses,
-        overview_status,
-        nav_status,
-        *holdings_statuses,
-        sector_status,
-        a_spot_status,
-    ]
+    statuses = [spot_status, *daily_statuses, *index_statuses, overview_status, nav_status, *holdings_statuses, sector_status, a_spot_status]
     status_df = pd.DataFrame([{"数据源": s.get("label"), "状态": "OK" if s.get("ok") else "FAIL", "说明": s.get("detail")} for s in statuses])
     st.dataframe(status_df, use_container_width=True, hide_index=True)
     st.subheader("数据库摘要")
@@ -2335,3 +2416,5 @@ with tabs[7]:
     except Exception as exc:  # noqa: BLE001
         st.warning(f"数据库摘要读取失败：{type(exc).__name__}: {exc}")
     st.caption("公网免费接口存在延迟、限流、字段变化和临时不可用。实盘前建议接入券商或交易所授权行情源，并单独做回测和风控校验。")
+
+st.stop()
