@@ -83,6 +83,39 @@ THEME_TO_SECTOR = [
     (r"农业|养殖|畜牧", "养殖业"),
 ]
 
+MODEL_REFERENCES = [
+    {
+        "方向": "趋势/均线/突破",
+        "依据": "Brock, Lakonishok & LeBaron (1992), Journal of Finance：检验移动均线和交易区间突破等技术规则。",
+        "链接": "https://onlinelibrary.wiley.com/doi/10.1111/j.1540-6261.1992.tb04681.x",
+    },
+    {
+        "方向": "横截面动量",
+        "依据": "Jegadeesh & Titman (1993), Journal of Finance：过去表现强弱对后续收益具有统计解释力。",
+        "链接": "https://onlinelibrary.wiley.com/doi/10.1111/j.1540-6261.1993.tb04702.x",
+    },
+    {
+        "方向": "时间序列动量",
+        "依据": "Moskowitz, Ooi & Pedersen (2012), Journal of Financial Economics：资产自身过去收益对后续收益有预测信息。",
+        "链接": "https://pages.stern.nyu.edu/~lpederse/papers/TimeSeriesMomentum.pdf",
+    },
+    {
+        "方向": "量价确认",
+        "依据": "Lee & Swaminathan (2000), Journal of Finance：成交量影响价格动量的强度和持续性。",
+        "链接": "https://onlinelibrary.wiley.com/doi/10.1111/0022-1082.00280",
+    },
+    {
+        "方向": "流动性/成交额风险",
+        "依据": "Amihud (2002), Journal of Financial Markets：低流动性与资产预期收益和价格折价相关。",
+        "链接": "https://www.cis.upenn.edu/~mkearns/finread/amihud.pdf",
+    },
+    {
+        "方向": "基金披露边界",
+        "依据": "中国证监会《公开募集证券投资基金信息披露管理办法》：公开基金数据以净值、定期报告和组合披露为边界。",
+        "链接": "https://www.csrc.gov.cn/csrc/c101877/c1029542/content.shtml",
+    },
+]
+
 
 def data_status(label: str, ok: bool, detail: str) -> dict[str, Any]:
     return {"label": label, "ok": bool(ok), "detail": str(detail)}
@@ -1779,6 +1812,17 @@ def score_badge(action: str, tone: str) -> str:
     return f"<span class='badge' style='background:{bg};color:{fg}'>{action}</span>"
 
 
+def render_model_references() -> None:
+    st.subheader("模型依据与边界")
+    st.write(
+        "本工具采用“学术可解释因子 + A股短线风控经验”的混合框架：趋势、动量、量价和流动性来自可追溯研究；"
+        "主力资金、板块热度、跌破均线后的动作提示属于 A 股短线交易经验规则，需要结合实盘滑点和数据延迟校验。"
+    )
+    ref_df = pd.DataFrame(MODEL_REFERENCES)
+    st.dataframe(ref_df, use_container_width=True, hide_index=True)
+    st.caption("模型不是收益承诺。公开基金持仓通常滞后披露，穿透贡献是估算项；ETF盘口、折溢价和主力资金字段依赖免费行情接口，需关注延迟和字段变化。")
+
+
 st.markdown(
     """
     <style>
@@ -2062,7 +2106,7 @@ if fund_mode == "场外基金":
         for col, label in zip(otc_header_cols, ["最新单位净值", "日增长率", "同类日表现分位", "申购状态", "赎回状态"]):
             col.metric(label, "-")
 
-    otc_tabs = st.tabs(["机会评分", "净值趋势", "持仓穿透", "自选池/查询", "模型"])
+    otc_tabs = st.tabs(["机会评分", "净值与动量", "资金与穿透", "板块与市场", "持仓与资产", "自选池/查询", "模型"])
 
     with otc_tabs[0]:
         factor_left, factor_right = st.columns([1.15, 1])
@@ -2095,35 +2139,21 @@ if fund_mode == "场外基金":
         otc_detail_cols[4].metric("120日回撤", pct_text(to_num(otc_raw.get("drawdown120"))))
 
     with otc_tabs[1]:
-        left, right = st.columns([1.25, 1])
-        with left:
-            if not otc_model["price_df"].empty:
-                st.plotly_chart(otc_nav_analysis_chart(otc_model["price_df"], f"{otc_code} {otc_name}：净值趋势 / 涨跌 / 回撤"), use_container_width=True)
-            else:
-                st.plotly_chart(nav_trend_chart(otc_nav_df, f"{otc_code} {otc_name}：单位净值走势"), use_container_width=True)
-        with right:
-            st.subheader("资产配置")
-            if otc_asset_df is not None and not otc_asset_df.empty:
-                fig = px.pie(otc_asset_df, names="资产类型", values="仓位占比", hole=0.45)
-                fig.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10))
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.write("未取得资产配置。")
-
-            st.subheader("映射板块/市场")
-            sector_info = otc_model.get("sector_info", {})
-            if otc_sector_name and sector_info.get("sector") not in {"无板块数据", "未匹配具体行业"}:
-                st.metric("板块", otc_sector_name, delta=pct_text(to_num(sector_info.get("pct_chg"))))
-                st.write(f"成交额排名：{to_num(sector_info.get('rank_amount')):.0f} ｜ 资金排名：{to_num(sector_info.get('rank_flow')):.0f}")
-            else:
-                st.write(sector_info.get("note", "未映射到明确板块，按同类日表现和市场环境处理。"))
-            st.write(f"市场环境：{market_env['regime']} ｜ {market_env['breadth_label']}")
-
-            st.subheader("基本信息")
-            if otc_basic_df is not None and not otc_basic_df.empty:
-                st.dataframe(otc_basic_df, use_container_width=True, hide_index=True)
-            else:
-                st.write("未取得基本信息。")
+        if not otc_model["price_df"].empty:
+            st.plotly_chart(otc_nav_analysis_chart(otc_model["price_df"], f"{otc_code} {otc_name}：净值趋势 / 涨跌 / 回撤"), use_container_width=True)
+            otc_ind = add_indicators(otc_model["price_df"])
+            otc_last = otc_ind.iloc[-1]
+            tech_cols = st.columns(7)
+            tech_cols[0].metric("MA5", f"{to_num(otc_last.get('ma5')):.4f}")
+            tech_cols[1].metric("MA10", f"{to_num(otc_last.get('ma10')):.4f}")
+            tech_cols[2].metric("MA20", f"{to_num(otc_last.get('ma20')):.4f}")
+            tech_cols[3].metric("MA60", f"{to_num(otc_last.get('ma60')):.4f}")
+            tech_cols[4].metric("近5日", pct_text(to_num(otc_raw.get("ret5"))))
+            tech_cols[5].metric("近20日", pct_text(to_num(otc_raw.get("ret20"))))
+            tech_cols[6].metric("120日回撤", pct_text(to_num(otc_raw.get("drawdown120"))))
+        else:
+            st.plotly_chart(nav_trend_chart(otc_nav_df, f"{otc_code} {otc_name}：单位净值走势"), use_container_width=True)
+        st.caption("场外基金没有盘中成交额，净值动量使用公开净值序列、阶段业绩和同类排名替代场内量价结构。")
 
     with otc_tabs[2]:
         st.subheader("重仓股实时穿透")
@@ -2148,13 +2178,53 @@ if fund_mode == "场外基金":
         else:
             st.write("未取得重仓股持仓。")
 
-        st.subheader("阶段业绩")
-        if otc_achievement_df is not None and not otc_achievement_df.empty:
-            st.dataframe(otc_achievement_df, use_container_width=True, hide_index=True)
-        else:
-            st.write("未取得阶段业绩。")
+        st.subheader("穿透解释")
+        st.write("场外基金没有交易所盘口和逐笔成交，资金确认使用公开重仓股实时涨跌、重仓主力净额、上涨重仓股比例和持仓权重集中度作为代理。")
 
     with otc_tabs[3]:
+        left, right = st.columns([1.3, 1])
+        with left:
+            st.subheader("行业热度")
+            st.plotly_chart(industry_heat_chart(sector_df), use_container_width=True)
+        with right:
+            st.subheader("市场环境")
+            st.metric("环境分", f"{market_env['score']:.1f}", delta=market_env["regime"])
+            st.write(market_env["index_label"])
+            st.write(market_env["breadth_label"])
+            st.plotly_chart(index_chart(index_df, index_label), use_container_width=True)
+            st.subheader("映射板块")
+            sector_info = otc_model.get("sector_info", {})
+            if otc_sector_name and sector_info.get("sector") not in {"无板块数据", "未匹配具体行业"}:
+                st.metric("板块", otc_sector_name, delta=pct_text(to_num(sector_info.get("pct_chg"))))
+                st.write(f"成交额排名：{to_num(sector_info.get('rank_amount')):.0f} ｜ 资金排名：{to_num(sector_info.get('rank_flow')):.0f}")
+            else:
+                st.write(sector_info.get("note", "未映射到明确板块，按同类日表现和市场环境处理。"))
+
+    with otc_tabs[4]:
+        left, right = st.columns([1, 1])
+        with left:
+            st.subheader("资产配置")
+            if otc_asset_df is not None and not otc_asset_df.empty:
+                fig = px.pie(otc_asset_df, names="资产类型", values="仓位占比", hole=0.45)
+                fig.update_layout(height=330, margin=dict(l=10, r=10, t=10, b=10))
+                st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(otc_asset_df, use_container_width=True, hide_index=True)
+            else:
+                st.write("未取得资产配置。")
+
+            st.subheader("基本信息")
+            if otc_basic_df is not None and not otc_basic_df.empty:
+                st.dataframe(otc_basic_df, use_container_width=True, hide_index=True)
+            else:
+                st.write("未取得基本信息。")
+        with right:
+            st.subheader("阶段业绩")
+            if otc_achievement_df is not None and not otc_achievement_df.empty:
+                st.dataframe(otc_achievement_df, use_container_width=True, hide_index=True)
+            else:
+                st.write("未取得阶段业绩。")
+
+    with otc_tabs[5]:
         watch_left, browse_right = st.columns([1, 1.15])
         with watch_left:
             st.subheader("场外基金自选池")
@@ -2170,13 +2240,14 @@ if fund_mode == "场外基金":
             otc_browse_table = build_open_fund_watch_table(open_fund_daily, fund_names, browse_codes)
             st.dataframe(format_open_fund_display(otc_browse_table), use_container_width=True, hide_index=True)
 
-    with otc_tabs[4]:
+    with otc_tabs[6]:
         st.subheader("场外基金评分公式")
         st.code("场外基金短线强度 = 趋势分*0.25 + 净值动能分*0.20 + 持仓穿透分*0.20 + 同类热度分*0.20 + 风险控制分*0.15", language="text")
         st.write(
             "减仓：净值跌破20日线，或重仓股估算贡献小于 -0.30% 且上涨重仓股比例偏低，或120日回撤超过12%。"
             "离场：净值跌破60日线，并且同类热度分低于48或持仓穿透分低于45。"
         )
+        render_model_references()
         st.subheader("数据源状态")
         statuses = [open_fund_daily_status, fund_names_status, otc_nav_status, otc_basic_status, otc_achievement_status, otc_asset_status, *otc_holdings_statuses, *index_statuses, sector_status, a_spot_status]
         status_df = pd.DataFrame([{"数据源": s.get("label"), "状态": "OK" if s.get("ok") else "FAIL", "说明": s.get("detail")} for s in statuses])
@@ -2218,6 +2289,27 @@ metric_row1[2].metric("成交额", format_money(latest_amount))
 metric_row2[0].metric("主力净额", format_money(main_amount), delta=pct_text(main_ratio))
 metric_row2[1].metric("量能倍数", f"{raw.get('amount_ratio5', np.nan):.2f}x", delta=f"20日 {raw.get('amount_ratio20', np.nan):.2f}x")
 metric_row2[2].metric("折溢价", pct_text(premium))
+
+st.subheader("场内自选池实时盯盘")
+if watchlist_table.empty:
+    st.info("场内自选池为空。可以在左侧搜索 ETF 后加入自选。")
+else:
+    watch_cols = st.columns(5)
+    watch_cols[0].metric("自选数量", f"{len(watchlist_table)}")
+    if "实时机会分" in watchlist_table:
+        watch_cols[1].metric("平均机会分", f"{watchlist_table['实时机会分'].dropna().mean():.1f}" if watchlist_table["实时机会分"].notna().any() else "-")
+    if "涨跌幅" in watchlist_table:
+        watch_cols[2].metric("上涨数量", f"{int((watchlist_table['涨跌幅'] > 0).sum())}")
+    if "主力净流入-净额" in watchlist_table:
+        watch_cols[3].metric("主力净额合计", format_money(watchlist_table["主力净流入-净额"].sum()))
+    if "盯盘提示" in watchlist_table:
+        watch_cols[4].metric("强势观察", f"{int((watchlist_table['盯盘提示'] == '强势观察').sum())}")
+
+    preview = watchlist_table.copy()
+    if "实时机会分" in preview:
+        preview = preview.sort_values("实时机会分", ascending=False, na_position="last")
+    st.dataframe(format_realtime_display(preview.head(12)), use_container_width=True, hide_index=True)
+    st.caption("完整自选池和全 ETF 查询仍在“自选池/查询”看板中。")
 
 tabs = st.tabs(["机会评分", "K线与量价", "资金与盘口", "板块与市场", "成分股穿透", "自选池/查询", "模型"])
 
@@ -2398,6 +2490,7 @@ with tabs[6]:
     st.write("减仓：高位放量滞涨，或价格跌破10日线且主力净流出。")
     st.write("买入观察：总分不低于72，趋势、量能、资金和风险均达到最低确认，且市场环境分不低于42。")
     st.write("持有：总分不低于58，未跌破20日线，且未出现明显主力流出。")
+    render_model_references()
 
     st.subheader("数据源状态")
     statuses = [spot_status, *daily_statuses, *index_statuses, overview_status, nav_status, *holdings_statuses, sector_status, a_spot_status]
