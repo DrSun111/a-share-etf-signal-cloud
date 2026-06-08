@@ -196,6 +196,14 @@ def save_watchlist(codes: Any) -> list[str]:
 
 
 def load_otc_watchlist() -> list[str]:
+    if st.session_state.get("use_db_watchlist"):
+        try:
+            codes = normalize_code_list(load_db_watchlist(owner="otc"))
+            st.session_state["otc_watchlist_codes"] = codes
+            return codes
+        except Exception as exc:  # noqa: BLE001 - fallback keeps the app usable.
+            st.session_state["db_watchlist_error"] = f"{type(exc).__name__}: {exc}"
+
     if "otc_watchlist_codes" in st.session_state:
         return normalize_code_list(st.session_state["otc_watchlist_codes"])
     codes = DEFAULT_OTC_WATCHLIST
@@ -216,6 +224,13 @@ def load_otc_watchlist() -> list[str]:
 def save_otc_watchlist(codes: Any) -> list[str]:
     normalized = normalize_code_list(codes)
     st.session_state["otc_watchlist_codes"] = normalized
+    if st.session_state.get("use_db_watchlist"):
+        try:
+            save_db_watchlist(normalized, owner="otc")
+        except Exception as exc:  # noqa: BLE001
+            st.session_state["db_watchlist_error"] = f"{type(exc).__name__}: {exc}"
+        return normalized
+
     try:
         OTC_WATCHLIST_FILE.write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:

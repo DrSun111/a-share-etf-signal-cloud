@@ -20,6 +20,7 @@
 - 新增 `otc_collector.py` 和 `run_otc_collector.ps1`：可在后台定时生成场外自选基金快照，写入 `otc_watch_snapshot`，前台优先读数据库排行。
 - 场外自选排行新增短线操作评分、动作、估算涨幅、实时穿透涨幅、重仓估算贡献、近 5/20 日、回撤和 MACD 指标。
 - 后台采集器加入本地接口缓存：基金名称、净值表、盘中估值、单基金净值历史和公开持仓会缓存到 `data/vendor_cache/`，减少重复爬取。
+- 打开「自选池保存到数据库」后，场内和场外自选都会保存到数据库；云端后台采集器会优先读取数据库里的场外自选代码。
 
 ## 场外基金说明
 
@@ -68,6 +69,12 @@ GitHub 可以保存和管理代码，但 GitHub Pages 不能直接运行 Python/
 本地直接点击侧边栏「同步实时行情入库」，会创建 `data/etf_signal.db` 并保存最新 ETF 快照。打开「优先读取数据库快照」后，看板会优先从数据库读取实时列表。
 
 场外基金可点击侧边栏「同步场外自选快照入库」，或运行 `run_otc_collector.ps1` 后台持续刷新。打开「场外自选优先读后台快照」后，场外自选池和评分排行会优先读取 `otc_watch_snapshot`，页面加载会明显更快。
+
+如需云端 GitHub Actions 在还没有数据库自选池时先跑起来，可在仓库 Variables 或 Secrets 里配置：
+
+```text
+OTC_WATCHLIST_CODES=019172,011036
+```
 
 云端部署时，在 Streamlit Cloud 或 GitHub Actions Secrets 中配置：
 

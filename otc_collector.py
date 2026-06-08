@@ -4,6 +4,7 @@ import argparse
 import html as html_lib
 import json
 import math
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,6 +18,7 @@ import numpy as np
 import pandas as pd
 import requests
 
+from db_store import load_watchlist as load_db_watchlist
 from db_store import save_otc_watch_snapshot
 
 
@@ -45,6 +47,15 @@ def normalize_code_list(raw: Any) -> list[str]:
 
 
 def load_otc_watchlist() -> list[str]:
+    env_codes = normalize_code_list(os.environ.get("OTC_WATCHLIST_CODES"))
+    if env_codes:
+        return env_codes
+    try:
+        db_codes = normalize_code_list(load_db_watchlist(owner="otc"))
+        if db_codes:
+            return db_codes
+    except Exception:  # noqa: BLE001
+        pass
     try:
         if OTC_WATCHLIST_FILE.exists():
             codes = normalize_code_list(json.loads(OTC_WATCHLIST_FILE.read_text(encoding="utf-8")))

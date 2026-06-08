@@ -18,6 +18,7 @@ jobs:
       - name: Collect market snapshot
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OTC_WATCHLIST_CODES: ${{ vars.OTC_WATCHLIST_CODES || secrets.OTC_WATCHLIST_CODES }}
         run: |
           python collector.py
           python otc_collector.py
