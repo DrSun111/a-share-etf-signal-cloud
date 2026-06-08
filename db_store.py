@@ -118,6 +118,16 @@ def init_db() -> None:
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS otc_watch_snapshot (
+            snapshot_ts TEXT NOT NULL,
+            code TEXT NOT NULL,
+            name TEXT,
+            total_score REAL,
+            action TEXT,
+            payload_json TEXT NOT NULL
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS watchlist (
             owner TEXT NOT NULL,
             code TEXT NOT NULL,
@@ -215,6 +225,26 @@ def save_score_snapshot(code: str, name: str, model: dict[str, Any], snapshot_ts
     return {"table": "score_snapshot", "snapshot_ts": snapshot_ts, "rows": _insert_rows("score_snapshot", rows)}
 
 
+def save_otc_watch_snapshot(df: pd.DataFrame, snapshot_ts: str | None = None) -> dict[str, Any]:
+    init_db()
+    snapshot_ts = snapshot_ts or now_iso()
+    rows = []
+    for payload in _json_ready_records(df):
+        code = str(payload.get("基金代码") or payload.get("code") or "").zfill(6)
+        name = str(payload.get("基金简称") or payload.get("基金名称") or payload.get("name") or "")
+        rows.append(
+            {
+                "snapshot_ts": snapshot_ts,
+                "code": code,
+                "name": name,
+                "total_score": payload.get("场外短线评分") or payload.get("total_score"),
+                "action": payload.get("动作") or payload.get("action"),
+                "payload_json": json.dumps(payload, ensure_ascii=False, default=str),
+            }
+        )
+    return {"table": "otc_watch_snapshot", "snapshot_ts": snapshot_ts, "rows": _insert_rows("otc_watch_snapshot", rows)}
+
+
 def _latest_ts(table: str) -> str | None:
     init_db()
     sql = f"SELECT MAX(snapshot_ts) AS snapshot_ts FROM {table}"
@@ -258,6 +288,10 @@ def load_latest_etf_spot() -> tuple[pd.DataFrame | None, dict[str, Any]]:
 
 def load_latest_sector_heat() -> tuple[pd.DataFrame | None, dict[str, Any]]:
     return _load_latest_payloads("sector_heat_snapshot")
+
+
+def load_latest_otc_watch_snapshot() -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    return _load_latest_payloads("otc_watch_snapshot")
 
 
 def save_watchlist(codes: list[str], owner: str = "default") -> int:
@@ -311,7 +345,7 @@ def load_watchlist(owner: str = "default") -> list[str]:
 def database_summary() -> dict[str, Any]:
     init_db()
     summary: dict[str, Any] = {"url": masked_database_url(), "backend": "SQLite" if is_sqlite_url() else "PostgreSQL"}
-    for table in ["etf_spot_snapshot", "sector_heat_snapshot", "score_snapshot", "watchlist"]:
+    for table in ["etf_spot_snapshot", "sector_heat_snapshot", "score_snapshot", "otc_watch_snapshot", "watchlist"]:
         latest = _latest_ts(table) if table != "watchlist" else None
         url = database_url()
         if is_sqlite_url(url):

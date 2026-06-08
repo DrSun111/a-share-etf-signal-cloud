@@ -17,6 +17,9 @@
 - 场外基金接入东方财富盘中净值估算，显示估算净值、估算涨幅、估算偏差，并优先用于场外机会分和同类估算分位。
 - 场外 `净值与动量` 图新增 DIF、DEA 和 MACD 柱。该 MACD 基于基金单位净值序列计算，不是交易所盘口级别的盘中 MACD。
 - 场外自选池支持点击切换分析标的：基金加入自选后，可在侧边栏或自选池看板中直接选择，无需再次手动搜索。
+- 新增 `otc_collector.py` 和 `run_otc_collector.ps1`：可在后台定时生成场外自选基金快照，写入 `otc_watch_snapshot`，前台优先读数据库排行。
+- 场外自选排行新增短线操作评分、动作、估算涨幅、实时穿透涨幅、重仓估算贡献、近 5/20 日、回撤和 MACD 指标。
+- 后台采集器加入本地接口缓存：基金名称、净值表、盘中估值、单基金净值历史和公开持仓会缓存到 `data/vendor_cache/`，减少重复爬取。
 
 ## 场外基金说明
 
@@ -47,6 +50,15 @@ cd C:\Users\28050\Documents\Codex\2026-06-07\a-etf-etf-k-50-m\outputs\etf_short_
 http://localhost:8501
 ```
 
+如需本地后台持续刷新场外自选排行，另开一个 PowerShell 窗口运行：
+
+```powershell
+cd C:\Users\28050\Documents\Codex\2026-06-07\a-etf-etf-k-50-m\outputs\etf_short_signal_app
+.\run_otc_collector.ps1
+```
+
+第一次运行会建立本地缓存，可能较慢；之后循环会优先读缓存并把最新场外自选快照写入数据库。
+
 ## 云端部署
 
 GitHub 可以保存和管理代码，但 GitHub Pages 不能直接运行 Python/Streamlit。推荐把本目录上传到 GitHub 仓库，再用 Streamlit Community Cloud 部署，入口文件选择 `app.py`。详见 `DEPLOY.md`。
@@ -55,13 +67,15 @@ GitHub 可以保存和管理代码，但 GitHub Pages 不能直接运行 Python/
 
 本地直接点击侧边栏「同步实时行情入库」，会创建 `data/etf_signal.db` 并保存最新 ETF 快照。打开「优先读取数据库快照」后，看板会优先从数据库读取实时列表。
 
+场外基金可点击侧边栏「同步场外自选快照入库」，或运行 `run_otc_collector.ps1` 后台持续刷新。打开「场外自选优先读后台快照」后，场外自选池和评分排行会优先读取 `otc_watch_snapshot`，页面加载会明显更快。
+
 云端部署时，在 Streamlit Cloud 或 GitHub Actions Secrets 中配置：
 
 ```text
 DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DBNAME
 ```
 
-然后用 `collector.py` 或 GitHub Actions 定时写入数据库，手机端看板读取数据库即可。
+然后用 `collector.py`、`otc_collector.py` 或 GitHub Actions 定时写入数据库，手机端看板读取数据库即可。
 
 ## 评分公式
 

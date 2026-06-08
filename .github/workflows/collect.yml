@@ -18,4 +18,6 @@ jobs:
       - name: Collect market snapshot
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python collector.py
+        run: |
+          python collector.py
+          python otc_collector.py
