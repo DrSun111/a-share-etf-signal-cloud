@@ -6,5 +6,6 @@ __pycache__/
 data/*.db
 data/*.db-*
 data/vendor_cache/
+streamlit.*.log
 watchlist.json
 otc_watchlist.json
