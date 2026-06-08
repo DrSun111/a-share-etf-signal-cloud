@@ -333,6 +333,50 @@ def get_fund_names() -> tuple[pd.DataFrame | None, dict[str, Any]]:
     return run_call("全部基金名称-东方财富/天天基金", ak.fund_name_em)
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def get_open_fund_estimation() -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    df, status = run_call("场外基金盘中估值-东方财富", ak.fund_value_estimation_em)
+    if df is None:
+        return None, status
+    out = df.copy()
+    if "基金代码" not in out.columns:
+        return None, data_status("场外基金盘中估值-东方财富", False, "缺少基金代码字段")
+    out["基金代码"] = out["基金代码"].astype(str).str.zfill(6)
+
+    rename: dict[str, str] = {}
+    estimate_date = ""
+    for col in out.columns:
+        text = str(col)
+        if "估算数据-估算值" in text:
+            rename[col] = "估算净值"
+            date_match = re.search(r"(\d{4}-\d{2}-\d{2})", text)
+            estimate_date = date_match.group(1) if date_match else estimate_date
+        elif "估算数据-估算增长率" in text:
+            rename[col] = "估算涨幅"
+            date_match = re.search(r"(\d{4}-\d{2}-\d{2})", text)
+            estimate_date = date_match.group(1) if date_match else estimate_date
+        elif "公布数据-单位净值" in text:
+            rename[col] = "公布单位净值"
+        elif "公布数据-日增长率" in text:
+            rename[col] = "公布日增长率"
+        elif text.endswith("单位净值") and "公布数据" not in text:
+            rename[col] = "上一净值"
+    out = out.rename(columns=rename)
+    for col in ["估算净值", "估算涨幅", "公布单位净值", "公布日增长率", "估算偏差", "上一净值"]:
+        if col in out.columns:
+            out[col] = numeric_series(out[col])
+    out["估算日期"] = estimate_date or datetime.now().strftime("%Y-%m-%d")
+    keep = ["基金代码", "基金名称", "估算净值", "估算涨幅", "估算偏差", "公布单位净值", "公布日增长率", "上一净值", "估算日期"]
+    return out[[col for col in keep if col in out.columns]], status
+
+
+def latest_open_fund_estimation_row(estimation_df: pd.DataFrame | None, code: str) -> pd.Series | None:
+    if estimation_df is None or estimation_df.empty or "基金代码" not in estimation_df.columns:
+        return None
+    hit = estimation_df[estimation_df["基金代码"].astype(str).str.zfill(6) == clean_code(code)]
+    return hit.iloc[0] if not hit.empty else None
+
+
 def fetch_open_fund_nav_history_em(code: str, max_pages: int = 35) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -1212,7 +1256,9 @@ def score_open_fund_model(
     nav_df: pd.DataFrame | None,
     index_df: pd.DataFrame | None,
     open_fund_daily: pd.DataFrame | None,
+    estimation_df: pd.DataFrame | None,
     otc_row: pd.Series | None,
+    estimation_row: pd.Series | None,
     achievement_df: pd.DataFrame | None,
     asset_df: pd.DataFrame | None,
     holding_impact: pd.DataFrame | None,
@@ -1252,7 +1298,8 @@ def score_open_fund_model(
         + linear_score(rel_strength, -7, 8) * 0.06
     )
 
-    daily_pct = to_num(otc_row.get("日增长率")) if otc_row is not None else to_num(last.get("pct"))
+    estimate_pct = to_num(estimation_row.get("估算涨幅")) if estimation_row is not None else np.nan
+    daily_pct = estimate_pct if pd.notna(estimate_pct) else (to_num(otc_row.get("日增长率")) if otc_row is not None else to_num(last.get("pct")))
     ret5 = to_num(last.get("return5"))
     ret10 = to_num(last.get("return10"))
     ret20 = to_num(last.get("return20"))
@@ -1299,7 +1346,10 @@ def score_open_fund_model(
     )
 
     sector_score, sector_info = sector_heat_score(sector_df, sector_name)
-    peer_rank = percentile_score(daily_pct, open_fund_daily["日增长率"]) if open_fund_daily is not None and "日增长率" in open_fund_daily.columns else 50.0
+    if estimation_df is not None and "估算涨幅" in estimation_df.columns and estimation_df["估算涨幅"].notna().any() and pd.notna(estimate_pct):
+        peer_rank = percentile_score(estimate_pct, estimation_df["估算涨幅"])
+    else:
+        peer_rank = percentile_score(daily_pct, open_fund_daily["日增长率"]) if open_fund_daily is not None and "日增长率" in open_fund_daily.columns else 50.0
     peer_score = clamp(peer_rank * 0.36 + sector_score * 0.28 + achievement_rank * 0.22 + market_env.get("score", 50) * 0.14)
 
     high60 = to_num(last.get("high60"))
@@ -1408,6 +1458,9 @@ def score_open_fund_model(
         "negatives": negatives,
         "raw": {
             "daily_pct": daily_pct,
+            "estimate_pct": estimate_pct,
+            "estimated_nav": to_num(estimation_row.get("估算净值")) if estimation_row is not None else np.nan,
+            "estimate_bias": to_num(estimation_row.get("估算偏差")) if estimation_row is not None else np.nan,
             "ret5": ret5,
             "ret10": ret10,
             "ret20": ret20,
@@ -1551,7 +1604,12 @@ def format_realtime_display(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def build_open_fund_watch_table(daily_df: pd.DataFrame | None, names_df: pd.DataFrame | None, codes: list[str]) -> pd.DataFrame:
+def build_open_fund_watch_table(
+    daily_df: pd.DataFrame | None,
+    names_df: pd.DataFrame | None,
+    codes: list[str],
+    estimation_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     codes = normalize_code_list(codes)
     if not codes:
         return pd.DataFrame()
@@ -1573,16 +1631,28 @@ def build_open_fund_watch_table(daily_df: pd.DataFrame | None, names_df: pd.Data
             names = names_df.copy()
             names["基金代码"] = names["基金代码"].astype(str).str.zfill(6)
             out = out.merge(names[["基金代码", "基金类型"]], on="基金代码", how="left")
+        if estimation_df is not None and not estimation_df.empty and "基金代码" in estimation_df.columns:
+            est = estimation_df.copy()
+            est["基金代码"] = est["基金代码"].astype(str).str.zfill(6)
+            est_cols = ["基金代码", "估算净值", "估算涨幅", "估算偏差", "公布单位净值", "公布日增长率", "上一净值", "估算日期"]
+            est_cols = [col for col in est_cols if col in est.columns]
+            out = out.merge(est[est_cols], on="基金代码", how="left")
         for col in out.columns:
-            if "单位净值" in col or "累计净值" in col or col in {"日增长值", "日增长率"}:
+            if "单位净值" in col or "累计净值" in col or col in {"日增长值", "日增长率", "估算净值", "估算涨幅", "估算偏差", "公布单位净值", "公布日增长率", "上一净值"}:
                 out[col] = numeric_series(out[col])
-        if "日增长率" in out.columns:
-            benchmark = daily_df["日增长率"] if daily_df is not None and "日增长率" in daily_df.columns else out["日增长率"]
-            out["场外机会分"] = out["日增长率"].map(lambda x: percentile_score(x, benchmark)).clip(0, 100)
+        realtime_pct = out["估算涨幅"].combine_first(out["日增长率"]) if {"估算涨幅", "日增长率"}.issubset(out.columns) else out.get("日增长率", pd.Series(np.nan, index=out.index))
+        if realtime_pct is not None:
+            if estimation_df is not None and not estimation_df.empty and "估算涨幅" in estimation_df.columns and estimation_df["估算涨幅"].notna().any():
+                benchmark = estimation_df["估算涨幅"]
+            elif daily_df is not None and "日增长率" in daily_df.columns:
+                benchmark = daily_df["日增长率"]
+            else:
+                benchmark = realtime_pct
+            out["场外机会分"] = realtime_pct.map(lambda x: percentile_score(x, benchmark)).clip(0, 100)
             out["盯盘提示"] = np.select(
                 [
-                    out["日增长率"] >= 3.5,
-                    out["日增长率"] <= -2.5,
+                    realtime_pct >= 3.5,
+                    realtime_pct <= -2.5,
                     out["场外机会分"] >= 75,
                     out["场外机会分"] <= 30,
                 ],
@@ -1598,15 +1668,21 @@ def format_open_fund_display(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for col in out.columns:
         if "单位净值" in col or "累计净值" in col:
-            out[col] = out[col].map(lambda x: f"{x:.4f}" if pd.notna(x) else "-")
+            out[col] = out[col].map(lambda x: f"{to_num(x):.4f}" if pd.notna(to_num(x)) else "-")
     for col in ["日增长值", "日增长率"]:
         if col in out:
-            out[col] = out[col].map(lambda x: pct_text(x) if col == "日增长率" else (f"{x:.4f}" if pd.notna(x) else "-"))
+            out[col] = out[col].map(lambda x: pct_text(to_num(x)) if col == "日增长率" else (f"{to_num(x):.4f}" if pd.notna(to_num(x)) else "-"))
+    for col in ["估算涨幅", "估算偏差", "公布日增长率"]:
+        if col in out:
+            out[col] = out[col].map(lambda x: pct_text(to_num(x)))
+    for col in ["估算净值", "公布单位净值", "上一净值"]:
+        if col in out:
+            out[col] = out[col].map(lambda x: f"{to_num(x):.4f}" if pd.notna(to_num(x)) else "-")
     if "场外机会分" in out:
-        out["场外机会分"] = out["场外机会分"].map(lambda x: f"{x:.1f}" if pd.notna(x) else "-")
-    cols = ["基金代码", "基金简称", "基金类型", "日增长率", "申购状态", "赎回状态", "手续费"]
+        out["场外机会分"] = out["场外机会分"].map(lambda x: f"{to_num(x):.1f}" if pd.notna(to_num(x)) else "-")
+    cols = ["基金代码", "基金简称", "基金类型", "估算涨幅", "估算净值", "估算偏差", "日增长率", "申购状态", "赎回状态", "手续费"]
     cols += ["场外机会分", "盯盘提示"]
-    cols += [col for col in out.columns if ("单位净值" in col or "累计净值" in col) and col not in cols]
+    cols += [col for col in out.columns if ("单位净值" in col or "累计净值" in col or col in {"公布日增长率", "公布单位净值", "上一净值", "估算日期"}) and col not in cols]
     return out[[col for col in cols if col in out.columns]]
 
 
@@ -1658,11 +1734,11 @@ def otc_nav_analysis_chart(price_df: pd.DataFrame, title: str) -> go.Figure:
     df = add_indicators(price_df).tail(220).copy()
     df["drawdown"] = df["close"] / df["close"].cummax() - 1
     fig = make_subplots(
-        rows=3,
+        rows=4,
         cols=1,
         shared_xaxes=True,
         vertical_spacing=0.03,
-        row_heights=[0.58, 0.20, 0.22],
+        row_heights=[0.48, 0.17, 0.20, 0.15],
     )
     fig.add_trace(go.Scatter(x=df["date"], y=df["close"], mode="lines", name="单位净值", line=dict(color="#1f77b4", width=2.2)), row=1, col=1)
     for col, color in [("ma5", "#f0a202"), ("ma20", "#7b61ff"), ("ma60", "#4d4d4d")]:
@@ -1679,6 +1755,18 @@ def otc_nav_analysis_chart(price_df: pd.DataFrame, title: str) -> go.Figure:
         col=1,
     )
     fig.add_trace(
+        go.Bar(
+            x=df["date"],
+            y=df["macd_hist"],
+            name="MACD柱",
+            marker_color=np.where(df["macd_hist"] >= 0, "#cf3f35", "#16845b"),
+        ),
+        row=3,
+        col=1,
+    )
+    fig.add_trace(go.Scatter(x=df["date"], y=df["macd"], mode="lines", name="DIF", line=dict(color="#2f80ed", width=1.3)), row=3, col=1)
+    fig.add_trace(go.Scatter(x=df["date"], y=df["macd_signal"], mode="lines", name="DEA", line=dict(color="#f0a202", width=1.3)), row=3, col=1)
+    fig.add_trace(
         go.Scatter(
             x=df["date"],
             y=df["drawdown"] * 100,
@@ -1687,18 +1775,19 @@ def otc_nav_analysis_chart(price_df: pd.DataFrame, title: str) -> go.Figure:
             fill="tozeroy",
             line=dict(color="#8a5a00", width=1.5),
         ),
-        row=3,
+        row=4,
         col=1,
     )
     fig.update_layout(
         title=title,
-        height=620,
+        height=720,
         margin=dict(l=20, r=20, t=45, b=20),
         legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
     )
     fig.update_yaxes(title_text="净值", row=1, col=1)
     fig.update_yaxes(title_text="涨跌%", row=2, col=1)
-    fig.update_yaxes(title_text="回撤%", row=3, col=1)
+    fig.update_yaxes(title_text="MACD", row=3, col=1)
+    fig.update_yaxes(title_text="回撤%", row=4, col=1)
     return fig
 
 
@@ -1884,9 +1973,11 @@ if fund_mode == "场外基金":
     with st.spinner("正在读取场外基金列表..."):
         open_fund_daily, open_fund_daily_status = get_open_fund_daily()
         fund_names, fund_names_status = get_fund_names()
+        open_fund_estimation, open_fund_estimation_status = get_open_fund_estimation()
 else:
     open_fund_daily, open_fund_daily_status = None, data_status("开放式基金净值-东方财富/天天基金", True, "场内模式未读取")
     fund_names, fund_names_status = None, data_status("全部基金名称-东方财富/天天基金", True, "场内模式未读取")
+    open_fund_estimation, open_fund_estimation_status = None, data_status("场外基金盘中估值-东方财富", True, "场内模式未读取")
 
 
 with st.sidebar:
@@ -1963,6 +2054,25 @@ with st.sidebar:
                 st.rerun()
 
         otc_watchlist_text = st.text_area("场外自选代码", value=" ".join(otc_watchlist_codes), height=60)
+        otc_watchlist_label_options = [open_fund_label_for_code(open_fund_daily, fund_names, item) for item in otc_watchlist_codes]
+        if otc_watchlist_label_options:
+            current_focus_code = clean_code(st.session_state.get("selected_otc_code", otc_code))
+            focus_index = 0
+            for idx, label in enumerate(otc_watchlist_label_options):
+                if extract_code_from_label(label) == current_focus_code:
+                    focus_index = idx
+                    break
+            current_focus_label = otc_watchlist_label_options[focus_index]
+            if (
+                st.session_state.get("sidebar_otc_watch_focus") not in otc_watchlist_label_options
+                or extract_code_from_label(st.session_state.get("sidebar_otc_watch_focus", "")) != current_focus_code
+            ):
+                st.session_state["sidebar_otc_watch_focus"] = current_focus_label
+            focus_otc_label = st.selectbox("点击自选基金查看分析", otc_watchlist_label_options, index=focus_index, key="sidebar_otc_watch_focus")
+            focus_otc_code = extract_code_from_label(focus_otc_label)
+            if focus_otc_code and focus_otc_code != current_focus_code:
+                st.session_state["selected_otc_code"] = focus_otc_code
+                st.rerun()
         otc_save_col, otc_clear_col = st.columns(2)
         with otc_save_col:
             if st.button("保存场外自选", use_container_width=True):
@@ -2056,16 +2166,21 @@ factor_scores = model["factor_scores"]
 leaderboard = build_etf_leaderboard(etf_spot, leaderboard_size)
 watchlist_table = build_realtime_etf_table(etf_spot, codes=watchlist_codes)
 etf_holding_impact, etf_estimated_contribution = build_holding_impact_table(holdings_df, a_spot)
-otc_watchlist_table = build_open_fund_watch_table(open_fund_daily, fund_names, otc_watchlist_codes)
+otc_watchlist_table = build_open_fund_watch_table(open_fund_daily, fund_names, otc_watchlist_codes, open_fund_estimation)
 otc_row = latest_open_fund_row(open_fund_daily, otc_code)
+otc_estimation_row = latest_open_fund_estimation_row(open_fund_estimation, otc_code)
 otc_name = str(otc_row.get("基金简称")) if otc_row is not None and "基金简称" in otc_row.index else otc_code
+if otc_estimation_row is not None and "基金名称" in otc_estimation_row.index and str(otc_name) == otc_code:
+    otc_name = str(otc_estimation_row.get("基金名称"))
 otc_holding_impact, otc_estimated_contribution = build_holding_impact_table(otc_holdings_df, a_spot)
 otc_sector_name = infer_sector_name(otc_name, "", custom_sector, sector_df)
 otc_model = score_open_fund_model(
     otc_nav_df,
     index_df,
     open_fund_daily,
+    open_fund_estimation,
     otc_row,
+    otc_estimation_row,
     otc_achievement_df,
     otc_asset_df,
     otc_holding_impact,
@@ -2094,16 +2209,17 @@ if fund_mode == "场外基金":
         st.markdown("状态")
         st.markdown(score_badge(otc_model["action"], otc_model["action_tone"]), unsafe_allow_html=True)
 
-    otc_header_cols = st.columns(5)
+    otc_header_cols = st.columns(6)
     if otc_row is not None:
         nav_col = next((col for col in otc_row.index if "单位净值" in str(col)), None)
         otc_header_cols[0].metric("最新单位净值", f"{to_num(otc_row.get(nav_col)):.4f}" if nav_col else "-")
         otc_header_cols[1].metric("日增长率", pct_text(to_num(otc_row.get("日增长率"))))
-        otc_header_cols[2].metric("同类日表现分位", pct_text(to_num(otc_raw.get("peer_rank")), 1))
-        otc_header_cols[3].metric("申购状态", str(otc_row.get("申购状态", "-")))
-        otc_header_cols[4].metric("赎回状态", str(otc_row.get("赎回状态", "-")))
+        otc_header_cols[2].metric("估算净值", f"{to_num(otc_raw.get('estimated_nav')):.4f}" if pd.notna(to_num(otc_raw.get("estimated_nav"))) else "-")
+        otc_header_cols[3].metric("估算涨幅", pct_text(to_num(otc_raw.get("estimate_pct"))), delta=f"偏差 {pct_text(to_num(otc_raw.get('estimate_bias')))}")
+        otc_header_cols[4].metric("同类估算分位", pct_text(to_num(otc_raw.get("peer_rank")), 1))
+        otc_header_cols[5].metric("申/赎状态", f"{otc_row.get('申购状态', '-')} / {otc_row.get('赎回状态', '-')}")
     else:
-        for col, label in zip(otc_header_cols, ["最新单位净值", "日增长率", "同类日表现分位", "申购状态", "赎回状态"]):
+        for col, label in zip(otc_header_cols, ["最新单位净值", "日增长率", "估算净值", "估算涨幅", "同类估算分位", "申/赎状态"]):
             col.metric(label, "-")
 
     otc_tabs = st.tabs(["机会评分", "净值与动量", "资金与穿透", "板块与市场", "持仓与资产", "自选池/查询", "模型"])
@@ -2140,17 +2256,20 @@ if fund_mode == "场外基金":
 
     with otc_tabs[1]:
         if not otc_model["price_df"].empty:
-            st.plotly_chart(otc_nav_analysis_chart(otc_model["price_df"], f"{otc_code} {otc_name}：净值趋势 / 涨跌 / 回撤"), use_container_width=True)
+            st.plotly_chart(otc_nav_analysis_chart(otc_model["price_df"], f"{otc_code} {otc_name}：净值趋势 / 涨跌 / MACD / 回撤"), use_container_width=True)
             otc_ind = add_indicators(otc_model["price_df"])
             otc_last = otc_ind.iloc[-1]
-            tech_cols = st.columns(7)
+            tech_cols = st.columns(10)
             tech_cols[0].metric("MA5", f"{to_num(otc_last.get('ma5')):.4f}")
             tech_cols[1].metric("MA10", f"{to_num(otc_last.get('ma10')):.4f}")
             tech_cols[2].metric("MA20", f"{to_num(otc_last.get('ma20')):.4f}")
             tech_cols[3].metric("MA60", f"{to_num(otc_last.get('ma60')):.4f}")
             tech_cols[4].metric("近5日", pct_text(to_num(otc_raw.get("ret5"))))
             tech_cols[5].metric("近20日", pct_text(to_num(otc_raw.get("ret20"))))
-            tech_cols[6].metric("120日回撤", pct_text(to_num(otc_raw.get("drawdown120"))))
+            tech_cols[6].metric("DIF", f"{to_num(otc_last.get('macd')):.4f}")
+            tech_cols[7].metric("DEA", f"{to_num(otc_last.get('macd_signal')):.4f}")
+            tech_cols[8].metric("MACD柱", f"{to_num(otc_last.get('macd_hist')):.4f}")
+            tech_cols[9].metric("120日回撤", pct_text(to_num(otc_raw.get("drawdown120"))))
         else:
             st.plotly_chart(nav_trend_chart(otc_nav_df, f"{otc_code} {otc_name}：单位净值走势"), use_container_width=True)
         st.caption("场外基金没有盘中成交额，净值动量使用公开净值序列、阶段业绩和同类排名替代场内量价结构。")
@@ -2231,13 +2350,30 @@ if fund_mode == "场外基金":
             if otc_watchlist_table.empty:
                 st.info("场外基金自选池为空。可在左侧搜索后加入。")
             else:
+                otc_watch_labels = [open_fund_label_for_code(open_fund_daily, fund_names, item) for item in otc_watchlist_codes]
+                current_watch_index = 0
+                for idx, label in enumerate(otc_watch_labels):
+                    if extract_code_from_label(label) == otc_code:
+                        current_watch_index = idx
+                        break
+                current_watch_label = otc_watch_labels[current_watch_index]
+                if (
+                    st.session_state.get("otc_watchlist_click_select") not in otc_watch_labels
+                    or extract_code_from_label(st.session_state.get("otc_watchlist_click_select", "")) != otc_code
+                ):
+                    st.session_state["otc_watchlist_click_select"] = current_watch_label
+                chosen_otc_watch = st.selectbox("点击自选基金查看分析", otc_watch_labels, index=current_watch_index, key="otc_watchlist_click_select")
+                chosen_otc_code = extract_code_from_label(chosen_otc_watch)
+                if chosen_otc_code and chosen_otc_code != otc_code:
+                    st.session_state["selected_otc_code"] = chosen_otc_code
+                    st.rerun()
                 st.dataframe(format_open_fund_display(otc_watchlist_table), use_container_width=True, hide_index=True)
         with browse_right:
             st.subheader("开放式基金查询")
             otc_browse_query = st.text_input("场外基金表内搜索", value="", placeholder="输入基金代码、名称、类型或拼音", key="otc_browse_query")
             otc_browse_options = build_open_fund_search_options(open_fund_daily, fund_names, otc_browse_query, otc_code, limit=300)
             browse_codes = [extract_code_from_label(item) for item in otc_browse_options]
-            otc_browse_table = build_open_fund_watch_table(open_fund_daily, fund_names, browse_codes)
+            otc_browse_table = build_open_fund_watch_table(open_fund_daily, fund_names, browse_codes, open_fund_estimation)
             st.dataframe(format_open_fund_display(otc_browse_table), use_container_width=True, hide_index=True)
 
     with otc_tabs[6]:
@@ -2249,7 +2385,7 @@ if fund_mode == "场外基金":
         )
         render_model_references()
         st.subheader("数据源状态")
-        statuses = [open_fund_daily_status, fund_names_status, otc_nav_status, otc_basic_status, otc_achievement_status, otc_asset_status, *otc_holdings_statuses, *index_statuses, sector_status, a_spot_status]
+        statuses = [open_fund_daily_status, open_fund_estimation_status, fund_names_status, otc_nav_status, otc_basic_status, otc_achievement_status, otc_asset_status, *otc_holdings_statuses, *index_statuses, sector_status, a_spot_status]
         status_df = pd.DataFrame([{"数据源": s.get("label"), "状态": "OK" if s.get("ok") else "FAIL", "说明": s.get("detail")} for s in statuses])
         st.dataframe(status_df, use_container_width=True, hide_index=True)
 
