@@ -1978,6 +1978,32 @@ def open_fund_model_from_snapshot(row: pd.Series | None, nav_df: pd.DataFrame | 
         }
 
     price_df = otc_nav_to_price_df(nav_df)
+    through_nav = to_num(row.get("实时穿透净值"))
+    if pd.isna(through_nav):
+        through_nav = to_num(row.get("估算净值"))
+    through_pct = to_num(row.get("实时穿透涨幅"))
+    if pd.isna(through_pct):
+        through_pct = to_num(row.get("估算涨幅"))
+    if pd.notna(through_nav):
+        snapshot_dt = pd.to_datetime(row.get("快照时间"), errors="coerce")
+        snapshot_dt = snapshot_dt if pd.notna(snapshot_dt) else pd.Timestamp(date.today())
+        append_row = pd.DataFrame(
+            {
+                "date": [snapshot_dt.normalize()],
+                "open": [through_nav],
+                "high": [through_nav],
+                "low": [through_nav],
+                "close": [through_nav],
+                "volume": [1.0],
+                "amount": [(abs(through_pct) if pd.notna(through_pct) else 1.0) * 10000],
+                "pct": [through_pct],
+            }
+        )
+        if price_df.empty:
+            price_df = append_row
+        else:
+            price_df = pd.concat([price_df, append_row], ignore_index=True)
+            price_df = price_df.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
     factor_scores = {
         "趋势分": to_num(row.get("趋势分")),
         "净值动能分": to_num(row.get("净值动能分")),
