@@ -91,6 +91,8 @@ OTC_WATCHLIST_CODES=025857,110022,018345
 ETF_WATCHLIST_CODES=510300,159915
 ```
 
+如果没有配置这两个变量，GitHub Actions 会回退读取仓库里的 `otc_watchlist.json` 和 `watchlist.json`。
+
 也可以手动写入自选池：
 
 ```powershell
