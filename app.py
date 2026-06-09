@@ -21,7 +21,9 @@ from plotly.subplots import make_subplots
 from collector import collect_market_snapshot
 from db_store import (
     database_summary,
+    is_sqlite_url,
     load_latest_etf_spot,
+    load_latest_otc_nav_history,
     load_latest_otc_watch_snapshot,
     load_latest_sector_heat,
     save_score_snapshot,
@@ -554,6 +556,20 @@ def get_open_fund_nav_from_collector_cache(code: str) -> tuple[pd.DataFrame | No
             out[col] = numeric_series(out[col])
     age = datetime.now() - datetime.fromtimestamp(path.stat().st_mtime)
     return out, data_status("场外基金净值-本地后台缓存", True, f"{len(out):,} 行，约 {int(age.total_seconds())} 秒前")
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_open_fund_nav_from_db(code: str) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    df, status = load_latest_otc_nav_history(clean_code(code))
+    if df is None or df.empty:
+        return df, status
+    out = df.copy()
+    if "净值日期" in out.columns:
+        out["净值日期"] = pd.to_datetime(out["净值日期"], errors="coerce")
+    for col in out.columns:
+        if "单位净值" in str(col) or "累计净值" in str(col) or "日增长率" in str(col):
+            out[col] = numeric_series(out[col])
+    return out, status
 
 
 
@@ -2314,26 +2330,39 @@ st.markdown(
 )
 
 
+try:
+    cloud_database_default = not is_sqlite_url()
+except Exception:  # noqa: BLE001
+    cloud_database_default = False
+
+
 with st.sidebar:
     st.header("数据库")
+    db_only_mode = st.toggle(
+        "云端极速读库模式",
+        value=st.session_state.get("db_only_mode", cloud_database_default),
+        help="开启后网页端只读数据库快照；爬取交给 GitHub Actions 后台，缺失数据不在网页里临时抓取。",
+    )
+    st.session_state["db_only_mode"] = db_only_mode
+    default_fund_mode = "场外基金" if cloud_database_default else "场内ETF"
     fund_mode = st.radio(
         "分析类型",
         ["场内ETF", "场外基金"],
-        index=0 if st.session_state.get("fund_mode", "场内ETF") == "场内ETF" else 1,
+        index=0 if st.session_state.get("fund_mode", default_fund_mode) == "场内ETF" else 1,
         horizontal=True,
     )
     st.session_state["fund_mode"] = fund_mode
-    fast_refresh_mode = st.toggle("极速刷新模式", value=st.session_state.get("fast_refresh_mode", True))
+    fast_refresh_mode = st.toggle("极速刷新模式", value=True if db_only_mode else st.session_state.get("fast_refresh_mode", True), disabled=db_only_mode)
     st.session_state["fast_refresh_mode"] = fast_refresh_mode
-    load_deep_details = st.toggle("加载深度资料", value=st.session_state.get("load_deep_details", False))
+    load_deep_details = st.toggle("加载深度资料", value=False if db_only_mode else st.session_state.get("load_deep_details", False), disabled=db_only_mode)
     st.session_state["load_deep_details"] = load_deep_details
-    db_read_mode = st.toggle("优先读取数据库快照", value=st.session_state.get("db_read_mode", False))
+    db_read_mode = st.toggle("优先读取数据库快照", value=True if db_only_mode else st.session_state.get("db_read_mode", True), disabled=db_only_mode)
     st.session_state["db_read_mode"] = db_read_mode
-    otc_snapshot_mode = st.toggle("场外自选优先读后台快照", value=st.session_state.get("otc_snapshot_mode", True))
+    otc_snapshot_mode = st.toggle("场外自选优先读后台快照", value=True if db_only_mode else st.session_state.get("otc_snapshot_mode", True), disabled=db_only_mode)
     st.session_state["otc_snapshot_mode"] = otc_snapshot_mode
-    auto_collect_missing_otc = st.toggle("表格缺失时自动采集", value=st.session_state.get("auto_collect_missing_otc", True))
+    auto_collect_missing_otc = st.toggle("表格缺失时自动采集", value=False if db_only_mode else st.session_state.get("auto_collect_missing_otc", False), disabled=db_only_mode)
     st.session_state["auto_collect_missing_otc"] = auto_collect_missing_otc
-    use_db_watchlist = st.toggle("自选池保存到数据库", value=st.session_state.get("use_db_watchlist", False))
+    use_db_watchlist = st.toggle("自选池保存到数据库", value=True if db_only_mode else st.session_state.get("use_db_watchlist", True), disabled=db_only_mode)
     st.session_state["use_db_watchlist"] = use_db_watchlist
     if st.button("同步实时行情入库", use_container_width=True):
         try:
@@ -2362,8 +2391,11 @@ if fund_mode == "场外基金" and otc_snapshot_mode:
 elif db_read_mode or fast_refresh_mode:
     etf_spot, spot_status = get_etf_spot_from_db()
     if etf_spot is None:
-        live_spot, live_status = get_etf_spot()
-        etf_spot, spot_status = live_spot, {"ok": live_status.get("ok"), "label": "快照为空，已回退实时ETF行情", "detail": live_status.get("detail")}
+        if db_only_mode:
+            etf_spot, spot_status = None, data_status("ETF实时行情-数据库", False, "云端极速读库模式：快照为空，网页端不临时爬取")
+        else:
+            live_spot, live_status = get_etf_spot()
+            etf_spot, spot_status = live_spot, {"ok": live_status.get("ok"), "label": "快照为空，已回退实时ETF行情", "detail": live_status.get("detail")}
 else:
     etf_spot, spot_status = get_etf_spot()
 
@@ -2382,9 +2414,20 @@ if fund_mode == "场外基金":
         with st.spinner("正在读取场外基金后台快照..."):
             open_fund_daily = None
             open_fund_daily_status = data_status("开放式基金净值-东方财富/天天基金", True, "已使用后台快照，前台跳过全量净值表")
-            fund_names, fund_names_status = get_fund_names_from_collector_cache()
+            if db_only_mode:
+                fund_names = otc_watch_snapshot_df
+                fund_names_status = data_status("全部基金名称-数据库快照", True, f"使用场外后台快照 {len(otc_watch_snapshot_df):,} 只")
+            else:
+                fund_names, fund_names_status = get_fund_names_from_collector_cache()
             open_fund_estimation = None
             open_fund_estimation_status = data_status("场外基金盘中估值-东方财富", True, "已使用后台快照，前台跳过全量估算表")
+    elif db_only_mode:
+        open_fund_daily = None
+        open_fund_daily_status = data_status("开放式基金净值-数据库快照", False, "云端极速读库模式：后台快照为空，等待 GitHub Actions 刷新")
+        fund_names = otc_watch_snapshot_df
+        fund_names_status = data_status("全部基金名称-数据库快照", False, "云端极速读库模式：后台快照为空")
+        open_fund_estimation = None
+        open_fund_estimation_status = data_status("场外基金盘中估值-数据库快照", False, "云端极速读库模式：后台快照为空")
     elif fast_refresh_mode:
         with st.spinner("正在读取场外基金缓存..."):
             open_fund_daily, open_fund_daily_status = get_open_fund_daily_from_collector_cache()
@@ -2569,7 +2612,10 @@ if (
 use_otc_fast_snapshot = fund_mode == "场外基金" and otc_snapshot_mode and otc_snapshot_focus_row is not None
 
 with st.spinner("正在读取实时数据..."):
-    index_df, index_statuses = get_index_daily(index_symbol, start_str, end_str)
+    if db_only_mode:
+        index_df, index_statuses = None, [data_status("指数日K", True, "云端极速读库模式已跳过实时指数接口")]
+    else:
+        index_df, index_statuses = get_index_daily(index_symbol, start_str, end_str)
     if fund_mode == "场内ETF":
         daily_df, daily_statuses = get_etf_daily(code, start_str, end_str)
         if fast_refresh_mode and not load_deep_details:
@@ -2591,14 +2637,18 @@ with st.spinner("正在读取实时数据..."):
         nav_df, nav_status = None, data_status("ETF净值", True, "场外模式未读取")
         holdings_df, holdings_statuses = None, [data_status("ETF成分持仓", True, "场外模式未读取")]
         if use_otc_fast_snapshot:
-            otc_nav_df, otc_nav_status = get_open_fund_nav_from_collector_cache(otc_code)
+            otc_nav_df, otc_nav_status = get_open_fund_nav_from_db(otc_code)
+            if otc_nav_df is None and not db_only_mode:
+                otc_nav_df, otc_nav_status = get_open_fund_nav_from_collector_cache(otc_code)
             otc_basic_df, otc_basic_status = None, data_status("场外基金基本信息", True, "后台快照极速模式已跳过")
             otc_achievement_df, otc_achievement_status = None, data_status("场外基金业绩", True, "后台快照极速模式已跳过")
             otc_asset_df, otc_asset_status = None, data_status("场外基金资产配置", True, "后台快照极速模式已跳过")
             otc_holdings_df, otc_holdings_statuses = None, [data_status("场外基金股票持仓", True, "后台快照极速模式已跳过")]
         elif fast_refresh_mode and not load_deep_details:
-            otc_nav_df, otc_nav_status = get_open_fund_nav_from_collector_cache(otc_code)
-            if otc_nav_df is None:
+            otc_nav_df, otc_nav_status = get_open_fund_nav_from_db(otc_code)
+            if otc_nav_df is None and not db_only_mode:
+                otc_nav_df, otc_nav_status = get_open_fund_nav_from_collector_cache(otc_code)
+            if otc_nav_df is None and not db_only_mode:
                 otc_nav_df, otc_nav_status = get_open_fund_nav_trend(otc_code)
             otc_basic_df, otc_basic_status = None, data_status("场外基金基本信息", True, "极速模式已跳过")
             otc_achievement_df, otc_achievement_status = None, data_status("场外基金业绩", True, "极速模式已跳过")
