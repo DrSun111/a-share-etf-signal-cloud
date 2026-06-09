@@ -350,6 +350,24 @@ def get_fund_names() -> tuple[pd.DataFrame | None, dict[str, Any]]:
     return run_call("全部基金名称-东方财富/天天基金", ak.fund_name_em)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def get_fund_names_from_collector_cache() -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    path = APP_DIR / "data" / "vendor_cache" / "fund_names.pkl"
+    if not path.exists():
+        return None, data_status("全部基金名称-本地后台缓存", False, "暂无本地缓存")
+    try:
+        df = pd.read_pickle(path)
+    except Exception as exc:  # noqa: BLE001
+        return None, data_status("全部基金名称-本地后台缓存", False, f"{type(exc).__name__}: {exc}")
+    if df is None or df.empty:
+        return None, data_status("全部基金名称-本地后台缓存", False, "缓存为空")
+    out = df.copy()
+    if "基金代码" in out.columns:
+        out["基金代码"] = out["基金代码"].astype(str).str.zfill(6)
+    age = datetime.now() - datetime.fromtimestamp(path.stat().st_mtime)
+    return out, data_status("全部基金名称-本地后台缓存", True, f"{len(out):,} 行，约 {int(age.total_seconds())} 秒前")
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def get_open_fund_estimation() -> tuple[pd.DataFrame | None, dict[str, Any]]:
     df, status = run_call("场外基金盘中估值-东方财富", ak.fund_value_estimation_em)
@@ -453,6 +471,26 @@ def get_open_fund_nav_trend(code: str, indicator: str = "单位净值走势") ->
         except Exception as exc:  # noqa: BLE001
             return None, data_status(status["label"], False, f"返回为空；兜底失败 {type(exc).__name__}: {exc}")
     return out, status
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_open_fund_nav_from_collector_cache(code: str) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    code = clean_code(code)
+    path = APP_DIR / "data" / "vendor_cache" / f"nav_history_{code}.pkl"
+    if not path.exists():
+        return None, data_status("场外基金净值-本地后台缓存", False, f"{code} 暂无本地缓存")
+    try:
+        df = pd.read_pickle(path)
+    except Exception as exc:  # noqa: BLE001
+        return None, data_status("场外基金净值-本地后台缓存", False, f"{type(exc).__name__}: {exc}")
+    if df is None or df.empty:
+        return None, data_status("场外基金净值-本地后台缓存", False, "缓存为空")
+    out = df.copy()
+    for col in out.columns:
+        if "单位净值" in str(col) or "累计净值" in str(col) or "日增长率" in str(col):
+            out[col] = numeric_series(out[col])
+    age = datetime.now() - datetime.fromtimestamp(path.stat().st_mtime)
+    return out, data_status("场外基金净值-本地后台缓存", True, f"{len(out):,} 行，约 {int(age.total_seconds())} 秒前")
 
 
 
@@ -1786,6 +1824,91 @@ def otc_watch_rank_label(row: pd.Series | dict[str, Any]) -> str:
     return " | ".join([part for part in [code, name, score_text, action] if part])
 
 
+def open_fund_model_from_snapshot(row: pd.Series | None, nav_df: pd.DataFrame | None, market_env: dict[str, Any]) -> dict[str, Any]:
+    if row is None:
+        factor_scores = {"趋势分": 50.0, "净值动能分": 50.0, "持仓穿透分": 50.0, "同类热度分": 50.0, "风险控制分": 50.0}
+        return {
+            "price_df": pd.DataFrame(),
+            "factor_scores": factor_scores,
+            "total_score": 50.0,
+            "action": "数据不足",
+            "action_tone": "warn",
+            "sector_info": {"sector": "后台快照缺失", "note": "当前基金还没有后台快照"},
+            "sector_name": None,
+            "market_env": market_env,
+            "positives": [],
+            "negatives": ["当前基金还没有后台快照，可先加入场外自选并等待后台刷新。"],
+            "raw": {},
+        }
+
+    price_df = otc_nav_to_price_df(nav_df)
+    factor_scores = {
+        "趋势分": to_num(row.get("趋势分")),
+        "净值动能分": to_num(row.get("净值动能分")),
+        "持仓穿透分": to_num(row.get("持仓穿透分")),
+        "同类热度分": to_num(row.get("同类热度分")),
+        "风险控制分": to_num(row.get("风险控制分")),
+    }
+    factor_scores = {key: (50.0 if pd.isna(value) else float(value)) for key, value in factor_scores.items()}
+    total = to_num(row.get("场外短线评分"))
+    action = str(row.get("动作") or "观察等待")
+    if action in {"离场", "禁止追高"}:
+        tone = "risk"
+    elif action == "减仓":
+        tone = "warn"
+    elif action == "买入观察":
+        tone = "good"
+    else:
+        tone = "neutral"
+
+    positives: list[str] = []
+    negatives: list[str] = []
+    snapshot_time = str(row.get("快照时间") or "")
+    source = str(row.get("数据来源") or "后台快照")
+    positives.append(f"已读取后台快照：{snapshot_time or '最新一批'}")
+    positives.append(f"快照来源：{source}")
+    if to_num(row.get("近5日")) > 0:
+        positives.append(f"近5日净值表现 {to_num(row.get('近5日')):.2f}%")
+    if to_num(row.get("重仓估算贡献")) > 0:
+        positives.append(f"重仓股实时穿透贡献约 {to_num(row.get('重仓估算贡献')):.2f}%")
+    if action in {"减仓", "离场", "禁止追高"}:
+        negatives.append(f"后台快照动作提示为：{action}")
+    if to_num(row.get("120日回撤")) > 12:
+        negatives.append(f"120日回撤约 {to_num(row.get('120日回撤')):.2f}%，位置风险偏高")
+
+    return {
+        "price_df": price_df,
+        "factor_scores": factor_scores,
+        "total_score": clamp(total),
+        "action": action,
+        "action_tone": tone,
+        "sector_info": {"sector": "后台快照极速模式", "note": "详情页使用后台快照，前台已跳过慢速实时接口。"},
+        "sector_name": None,
+        "market_env": market_env,
+        "positives": positives,
+        "negatives": negatives,
+        "raw": {
+            "daily_pct": to_num(row.get("日增长率")),
+            "estimate_pct": to_num(row.get("估算涨幅")),
+            "estimated_nav": to_num(row.get("估算净值")),
+            "estimate_bias": to_num(row.get("估算偏差")),
+            "ret5": to_num(row.get("近5日")),
+            "ret10": to_num(row.get("近10日")),
+            "ret20": to_num(row.get("近20日")),
+            "peer_rank": to_num(row.get("同类热度分")),
+            "achievement_rank": np.nan,
+            "stock_position": np.nan,
+            "top_weight": to_num(row.get("前20持仓权重")),
+            "holding_contribution": to_num(row.get("重仓估算贡献")),
+            "holding_up_ratio": to_num(row.get("上涨重仓股比例")),
+            "space_to_high": np.nan,
+            "drawdown120": to_num(row.get("120日回撤")),
+            "volatility20": np.nan,
+            "max_drawdown": np.nan,
+        },
+    }
+
+
 def build_holding_impact_table(holdings_df: pd.DataFrame | None, a_spot: pd.DataFrame | None) -> tuple[pd.DataFrame, float]:
     if holdings_df is None or holdings_df.empty:
         return pd.DataFrame(), np.nan
@@ -2064,7 +2187,9 @@ with st.sidebar:
         except Exception as exc:  # noqa: BLE001
             st.warning(f"数据库暂不可用：{type(exc).__name__}: {exc}")
 
-if db_read_mode:
+if fund_mode == "场外基金" and otc_snapshot_mode:
+    etf_spot, spot_status = None, data_status("ETF实时行情-东方财富", True, "场外后台快照模式已跳过")
+elif db_read_mode:
     etf_spot, spot_status = get_etf_spot_from_db()
     if etf_spot is None:
         live_spot, live_status = get_etf_spot()
@@ -2084,10 +2209,10 @@ else:
     otc_watch_snapshot_df, otc_watch_snapshot_status = None, data_status("场外自选后台快照", True, "未启用或非场外模式")
 if fund_mode == "场外基金":
     if otc_snapshot_mode and otc_watch_snapshot_df is not None and not otc_watch_snapshot_df.empty:
-        with st.spinner("正在读取场外基金名称索引..."):
+        with st.spinner("正在读取场外基金后台快照..."):
             open_fund_daily = None
             open_fund_daily_status = data_status("开放式基金净值-东方财富/天天基金", True, "已使用后台快照，前台跳过全量净值表")
-            fund_names, fund_names_status = get_fund_names()
+            fund_names, fund_names_status = get_fund_names_from_collector_cache()
             open_fund_estimation = None
             open_fund_estimation_status = data_status("场外基金盘中估值-东方财富", True, "已使用后台快照，前台跳过全量估算表")
     else:
@@ -2216,6 +2341,8 @@ end_dt = date.today()
 start_dt = end_dt - timedelta(days=int(lookback * 1.7))
 start_str = start_dt.strftime("%Y%m%d")
 end_str = end_dt.strftime("%Y%m%d")
+otc_snapshot_focus_row = latest_otc_snapshot_row(otc_watch_snapshot_df, otc_code)
+use_otc_fast_snapshot = fund_mode == "场外基金" and otc_snapshot_mode and otc_snapshot_focus_row is not None
 
 with st.spinner("正在读取实时数据..."):
     index_df, index_statuses = get_index_daily(index_symbol, start_str, end_str)
@@ -2234,19 +2361,33 @@ with st.spinner("正在读取实时数据..."):
         overview_df, overview_status = None, data_status("ETF基金概况", True, "场外模式未读取")
         nav_df, nav_status = None, data_status("ETF净值", True, "场外模式未读取")
         holdings_df, holdings_statuses = None, [data_status("ETF成分持仓", True, "场外模式未读取")]
-        otc_nav_df, otc_nav_status = get_open_fund_nav_trend(otc_code)
-        otc_basic_df, otc_basic_status = get_open_fund_basic(otc_code)
-        otc_achievement_df, otc_achievement_status = get_open_fund_achievement(otc_code)
-        otc_asset_df, otc_asset_status = get_open_fund_asset_allocation(otc_code)
-        otc_holdings_df, otc_holdings_statuses = get_open_fund_holdings(otc_code)
+        if use_otc_fast_snapshot:
+            otc_nav_df, otc_nav_status = get_open_fund_nav_from_collector_cache(otc_code)
+            otc_basic_df, otc_basic_status = None, data_status("场外基金基本信息", True, "后台快照极速模式已跳过")
+            otc_achievement_df, otc_achievement_status = None, data_status("场外基金业绩", True, "后台快照极速模式已跳过")
+            otc_asset_df, otc_asset_status = None, data_status("场外基金资产配置", True, "后台快照极速模式已跳过")
+            otc_holdings_df, otc_holdings_statuses = None, [data_status("场外基金股票持仓", True, "后台快照极速模式已跳过")]
+        else:
+            otc_nav_df, otc_nav_status = get_open_fund_nav_trend(otc_code)
+            otc_basic_df, otc_basic_status = get_open_fund_basic(otc_code)
+            otc_achievement_df, otc_achievement_status = get_open_fund_achievement(otc_code)
+            otc_asset_df, otc_asset_status = get_open_fund_asset_allocation(otc_code)
+            otc_holdings_df, otc_holdings_statuses = get_open_fund_holdings(otc_code)
     if db_read_mode:
         sector_df, sector_status = get_sector_summary_from_db()
         if sector_df is None:
             live_sector_df, live_sector_status = get_sector_summary()
             sector_df, sector_status = live_sector_df, {"ok": live_sector_status.get("ok"), "label": "数据库为空，已回退实时行业热度", "detail": live_sector_status.get("detail")}
+    elif use_otc_fast_snapshot:
+        sector_df, sector_status = get_sector_summary_from_db()
+        if sector_df is None:
+            sector_df, sector_status = None, data_status("行业热度-数据库", True, "后台快照极速模式已跳过实时行业接口")
     else:
         sector_df, sector_status = get_sector_summary()
-    a_spot, a_spot_status = get_a_spot()
+    if use_otc_fast_snapshot:
+        a_spot, a_spot_status = None, data_status("A股实时行情-东方财富", True, "后台快照极速模式已跳过")
+    else:
+        a_spot, a_spot_status = get_a_spot()
 
 
 if fund_mode == "场内ETF" and (daily_df is None or daily_df.empty):
@@ -2291,7 +2432,6 @@ if otc_snapshot_mode and otc_watch_snapshot_df is not None and not otc_watch_sna
     otc_watchlist_table = filter_otc_snapshot_table(otc_watch_snapshot_df, otc_watchlist_codes)
 else:
     otc_watchlist_table = build_open_fund_watch_table(open_fund_daily, fund_names, otc_watchlist_codes, open_fund_estimation)
-otc_snapshot_focus_row = latest_otc_snapshot_row(otc_watch_snapshot_df, otc_code)
 otc_row = latest_open_fund_row(open_fund_daily, otc_code)
 if otc_row is None:
     otc_row = snapshot_to_open_fund_row(otc_snapshot_focus_row)
@@ -2303,20 +2443,24 @@ if otc_estimation_row is not None and "基金名称" in otc_estimation_row.index
     otc_name = str(otc_estimation_row.get("基金名称"))
 otc_holding_impact, otc_estimated_contribution = build_holding_impact_table(otc_holdings_df, a_spot)
 otc_sector_name = infer_sector_name(otc_name, "", custom_sector, sector_df)
-otc_model = score_open_fund_model(
-    otc_nav_df,
-    index_df,
-    open_fund_daily,
-    open_fund_estimation,
-    otc_row,
-    otc_estimation_row,
-    otc_achievement_df,
-    otc_asset_df,
-    otc_holding_impact,
-    sector_df,
-    otc_sector_name,
-    market_env,
-)
+if use_otc_fast_snapshot:
+    otc_model = open_fund_model_from_snapshot(otc_snapshot_focus_row, otc_nav_df, market_env)
+    otc_estimated_contribution = to_num(otc_snapshot_focus_row.get("重仓估算贡献")) if otc_snapshot_focus_row is not None else np.nan
+else:
+    otc_model = score_open_fund_model(
+        otc_nav_df,
+        index_df,
+        open_fund_daily,
+        open_fund_estimation,
+        otc_row,
+        otc_estimation_row,
+        otc_achievement_df,
+        otc_asset_df,
+        otc_holding_impact,
+        sector_df,
+        otc_sector_name,
+        market_env,
+    )
 otc_factor_scores = otc_model["factor_scores"]
 otc_raw = otc_model["raw"]
 
@@ -2324,6 +2468,8 @@ otc_raw = otc_model["raw"]
 if fund_mode == "场外基金":
     st.title("A股场外基金短线机会评分台")
     st.caption("场外基金页只显示开放式基金体系：净值趋势、阶段业绩、公开持仓穿透、同类热度和风险控制。公开数据不包含支付宝/微信账户持仓。")
+    if use_otc_fast_snapshot:
+        st.success("已启用后台快照极速模式：当前基金详情读取 otc_watch_snapshot，前台跳过慢速实时接口。")
 
     title_left, title_mid, title_right = st.columns([2.2, 1.1, 1.2])
     with title_left:

@@ -234,7 +234,7 @@ def get_fund_names() -> tuple[pd.DataFrame | None, dict[str, Any]]:
 
 
 def get_open_fund_estimation() -> tuple[pd.DataFrame | None, dict[str, Any]]:
-    df, status = cached_vendor("场外基金盘中估值-东方财富", "open_fund_estimation", 120, ak.fund_value_estimation_em)
+    df, status = cached_vendor("场外基金盘中估值-东方财富", "open_fund_estimation", 180, ak.fund_value_estimation_em)
     if df is None or "基金代码" not in df.columns:
         return None, status
     out = df.copy()
