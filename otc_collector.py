@@ -50,19 +50,19 @@ def load_otc_watchlist() -> list[str]:
     env_codes = normalize_code_list(os.environ.get("OTC_WATCHLIST_CODES"))
     if env_codes:
         return env_codes
+    merged: list[str] = []
     try:
         db_codes = normalize_code_list(load_db_watchlist(owner="otc"))
-        if db_codes:
-            return db_codes
+        merged.extend(code for code in db_codes if code not in merged)
     except Exception:  # noqa: BLE001
         pass
     try:
         if OTC_WATCHLIST_FILE.exists():
             codes = normalize_code_list(json.loads(OTC_WATCHLIST_FILE.read_text(encoding="utf-8")))
-            return codes or DEFAULT_OTC_WATCHLIST
+            merged.extend(code for code in codes if code not in merged)
     except (OSError, json.JSONDecodeError):
         pass
-    return DEFAULT_OTC_WATCHLIST
+    return merged or DEFAULT_OTC_WATCHLIST
 
 
 def to_num(value: Any) -> float:
@@ -278,6 +278,44 @@ def get_a_spot() -> tuple[pd.DataFrame | None, dict[str, Any]]:
     return out, status
 
 
+def get_sina_holding_quotes(codes: list[str]) -> pd.DataFrame:
+    clean_codes = normalize_code_list(codes)[:40]
+    if not clean_codes:
+        return pd.DataFrame()
+    symbols = [("sh" if code.startswith(("5", "6", "9")) else "sz") + code for code in clean_codes]
+    try:
+        resp = requests.get(
+            "https://hq.sinajs.cn/list=" + ",".join(symbols),
+            headers={"Referer": "https://finance.sina.com.cn", "User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        text = resp.content.decode("gbk", errors="ignore")
+    except Exception:  # noqa: BLE001
+        return pd.DataFrame()
+
+    rows: list[dict[str, Any]] = []
+    pattern = re.compile(r'var hq_str_(?:sh|sz)(\d{6})="([^"]*)";')
+    for code, payload in pattern.findall(text):
+        parts = payload.split(",")
+        if len(parts) < 32 or not parts[0]:
+            continue
+        prev_close = to_num(parts[2])
+        latest = to_num(parts[3])
+        pct = (latest / prev_close - 1) * 100 if pd.notna(latest) and pd.notna(prev_close) and prev_close else np.nan
+        rows.append(
+            {
+                "股票代码": code,
+                "股票名称": parts[0],
+                "最新价": latest,
+                "涨跌幅": pct,
+                "成交额": to_num(parts[9]),
+                "主力净流入-净额": np.nan,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def latest_row(df: pd.DataFrame | None, code: str, code_col: str = "基金代码") -> pd.Series | None:
     if df is None or df.empty or code_col not in df.columns:
         return None
@@ -458,19 +496,20 @@ def score_watch_item(
 
     estimate_pct = to_num(est_row.get("估算涨幅")) if est_row is not None else np.nan
     daily_pct = to_num(daily_row.get("日增长率")) if daily_row is not None else to_num(last.get("pct"))
-    realtime_pct = estimate_pct if pd.notna(estimate_pct) else daily_pct
     positive_days5 = int((ind["pct"].tail(5) > 0).sum()) if not ind.empty and "pct" in ind.columns else 0
-    momentum_score = clamp(
-        linear_score(realtime_pct, -2.5, 2.8) * 0.28
-        + linear_score(ret5, -4.5, 6.5) * 0.28
-        + linear_score(ret20, -9, 13) * 0.24
-        + linear_score(positive_days5, 1, 4) * 0.20
-    )
 
     contribution = to_num(holding_metrics.get("holding_contribution"))
     top_weight = to_num(holding_metrics.get("top_weight"))
     up_ratio = to_num(holding_metrics.get("up_ratio"))
     main_flow = to_num(holding_metrics.get("main_flow"))
+    through_pct = contribution if pd.notna(contribution) else np.nan
+    realtime_pct = estimate_pct if pd.notna(estimate_pct) else (through_pct if pd.notna(through_pct) else daily_pct)
+    momentum_score = clamp(
+        linear_score(realtime_pct, -2.5, 2.8) * 0.36
+        + linear_score(ret5, -4.5, 6.5) * 0.24
+        + linear_score(ret20, -9, 13) * 0.20
+        + linear_score(positive_days5, 1, 4) * 0.20
+    )
     flow_score = linear_score(main_flow, -8e8, 8e8)
     holding_score = clamp(
         linear_score(contribution, -1.1, 1.2) * 0.44
@@ -549,9 +588,10 @@ def score_watch_item(
     if pd.isna(unit_nav):
         unit_nav = close
     estimated_nav = to_num(est_row.get("估算净值")) if est_row is not None else np.nan
-    if pd.isna(estimated_nav) and pd.notna(unit_nav) and pd.notna(contribution):
-        estimated_nav = unit_nav * (1 + contribution / 100)
-    realtime_through_pct = estimate_pct if pd.notna(estimate_pct) else contribution
+    through_nav = unit_nav * (1 + through_pct / 100) if pd.notna(unit_nav) and pd.notna(through_pct) else np.nan
+    if pd.isna(estimated_nav) and pd.notna(through_nav):
+        estimated_nav = through_nav
+    realtime_through_pct = through_pct
 
     return {
         "基金代码": code,
@@ -563,6 +603,7 @@ def score_watch_item(
         "估算净值": estimated_nav,
         "估算涨幅": estimate_pct,
         "估算偏差": to_num(est_row.get("估算偏差")) if est_row is not None else np.nan,
+        "实时穿透净值": through_nav,
         "实时穿透涨幅": realtime_through_pct,
         "重仓估算贡献": contribution,
         "前20持仓权重": top_weight,
@@ -611,7 +652,10 @@ def collect_otc_watch_snapshot(codes: list[str] | str | None = None) -> dict[str
             est_row = latest_row(estimation_df, code)
             nav_df = get_nav_history(code)
             holdings_df = get_holdings(code)
-            _, metrics = holding_impact(holdings_df, a_spot)
+            fund_spot = a_spot
+            if (fund_spot is None or fund_spot.empty) and holdings_df is not None and not holdings_df.empty and "股票代码" in holdings_df.columns:
+                fund_spot = get_sina_holding_quotes(holdings_df["股票代码"].astype(str).head(20).tolist())
+            _, metrics = holding_impact(holdings_df, fund_spot)
             return code, score_watch_item(code, daily_row, name_row, est_row, estimation_df, daily_df, nav_df, metrics), None
         except Exception as exc:  # noqa: BLE001 - keep other watchlist rows usable.
             return (

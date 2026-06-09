@@ -844,6 +844,37 @@ def open_fund_label_for_code(daily_df: pd.DataFrame | None, names_df: pd.DataFra
     return f"{code} | 未取到基金名称"
 
 
+def open_fund_name_for_code(
+    daily_df: pd.DataFrame | None,
+    names_df: pd.DataFrame | None,
+    snapshot_row: pd.Series | None,
+    estimation_row: pd.Series | None,
+    code: str,
+) -> str:
+    if snapshot_row is not None:
+        name = str(snapshot_row.get("基金简称") or snapshot_row.get("基金名称") or "").strip()
+        if name and name != code:
+            return name
+    row = latest_open_fund_row(daily_df, code)
+    if row is not None:
+        name = str(row.get("基金简称") or row.get("基金名称") or "").strip()
+        if name and name != code:
+            return name
+    if names_df is not None and not names_df.empty and "基金代码" in names_df.columns:
+        names = names_df.copy()
+        names["基金代码"] = names["基金代码"].astype(str).str.zfill(6)
+        hit = names[names["基金代码"] == clean_code(code)]
+        if not hit.empty:
+            name = str(hit.iloc[0].get("基金简称") or hit.iloc[0].get("基金名称") or "").strip()
+            if name and name != code:
+                return name
+    if estimation_row is not None:
+        name = str(estimation_row.get("基金名称") or "").strip()
+        if name and name != code:
+            return name
+    return clean_code(code)
+
+
 def build_open_fund_search_options(
     daily_df: pd.DataFrame | None,
     names_df: pd.DataFrame | None,
@@ -1327,6 +1358,32 @@ def score_open_fund_model(
     market_env: dict[str, Any],
 ) -> dict[str, Any]:
     price_df = otc_nav_to_price_df(nav_df)
+    through_nav = to_num(row.get("实时穿透净值"))
+    if pd.isna(through_nav):
+        through_nav = to_num(row.get("估算净值"))
+    through_pct = to_num(row.get("实时穿透涨幅"))
+    if pd.isna(through_pct):
+        through_pct = to_num(row.get("估算涨幅"))
+    if pd.notna(through_nav):
+        snapshot_dt = pd.to_datetime(row.get("快照时间"), errors="coerce")
+        snapshot_dt = snapshot_dt if pd.notna(snapshot_dt) else pd.Timestamp(date.today())
+        append_row = pd.DataFrame(
+            {
+                "date": [snapshot_dt.normalize()],
+                "open": [through_nav],
+                "high": [through_nav],
+                "low": [through_nav],
+                "close": [through_nav],
+                "volume": [1.0],
+                "amount": [(abs(through_pct) if pd.notna(through_pct) else 1.0) * 10000],
+                "pct": [through_pct],
+            }
+        )
+        if price_df.empty:
+            price_df = append_row
+        else:
+            price_df = pd.concat([price_df, append_row], ignore_index=True)
+            price_df = price_df.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
     ind = add_indicators(price_df) if len(price_df) >= 2 else pd.DataFrame()
     idx = add_indicators(index_df) if index_df is not None and len(index_df) >= 65 else None
     has_nav = not ind.empty
@@ -1735,7 +1792,7 @@ def format_open_fund_display(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["估算涨幅", "估算偏差", "公布日增长率", "实时穿透涨幅", "重仓估算贡献", "前20持仓权重", "上涨重仓股比例", "近5日", "近10日", "近20日", "120日回撤"]:
         if col in out:
             out[col] = out[col].map(lambda x: pct_text(to_num(x)))
-    for col in ["估算净值", "公布单位净值", "上一净值"]:
+    for col in ["估算净值", "实时穿透净值", "公布单位净值", "上一净值"]:
         if col in out:
             out[col] = out[col].map(lambda x: f"{to_num(x):.4f}" if pd.notna(to_num(x)) else "-")
     if "场外机会分" in out:
@@ -1749,7 +1806,7 @@ def format_open_fund_display(df: pd.DataFrame) -> pd.DataFrame:
     if "上涨重仓股数" in out:
         out["上涨重仓股数"] = out["上涨重仓股数"].map(lambda x: f"{to_num(x):.0f}" if pd.notna(to_num(x)) else "-")
     cols = ["基金代码", "基金简称", "基金类型", "场外短线评分", "动作", "估算涨幅", "实时穿透涨幅", "重仓估算贡献", "近5日", "近20日", "120日回撤"]
-    cols += ["估算净值", "估算偏差", "最新单位净值", "日增长率", "前20持仓权重", "上涨重仓股数", "上涨重仓股比例", "DIF", "DEA", "MACD柱"]
+    cols += ["实时穿透净值", "估算净值", "估算偏差", "最新单位净值", "日增长率", "前20持仓权重", "上涨重仓股数", "上涨重仓股比例", "DIF", "DEA", "MACD柱"]
     cols += ["场外机会分", "盯盘提示", "申购状态", "赎回状态", "手续费", "快照时间"]
     cols += [col for col in out.columns if ("单位净值" in col or "累计净值" in col or col in {"公布日增长率", "公布单位净值", "上一净值", "估算日期", "数据来源"}) and col not in cols]
     return out[[col for col in cols if col in out.columns]]
@@ -1892,6 +1949,8 @@ def open_fund_model_from_snapshot(row: pd.Series | None, nav_df: pd.DataFrame | 
             "estimate_pct": to_num(row.get("估算涨幅")),
             "estimated_nav": to_num(row.get("估算净值")),
             "estimate_bias": to_num(row.get("估算偏差")),
+            "through_nav": through_nav,
+            "through_pct": through_pct,
             "ret5": to_num(row.get("近5日")),
             "ret10": to_num(row.get("近10日")),
             "ret20": to_num(row.get("近20日")),
@@ -2438,9 +2497,7 @@ if otc_row is None:
 otc_estimation_row = latest_open_fund_estimation_row(open_fund_estimation, otc_code)
 if otc_estimation_row is None:
     otc_estimation_row = snapshot_to_estimation_row(otc_snapshot_focus_row)
-otc_name = str(otc_row.get("基金简称")) if otc_row is not None and "基金简称" in otc_row.index else otc_code
-if otc_estimation_row is not None and "基金名称" in otc_estimation_row.index and str(otc_name) == otc_code:
-    otc_name = str(otc_estimation_row.get("基金名称"))
+otc_name = open_fund_name_for_code(open_fund_daily, fund_names, otc_snapshot_focus_row, otc_estimation_row, otc_code)
 otc_holding_impact, otc_estimated_contribution = build_holding_impact_table(otc_holdings_df, a_spot)
 otc_sector_name = infer_sector_name(otc_name, "", custom_sector, sector_df)
 if use_otc_fast_snapshot:
@@ -2485,17 +2542,23 @@ if fund_mode == "场外基金":
         st.markdown(score_badge(otc_model["action"], otc_model["action_tone"]), unsafe_allow_html=True)
 
     otc_header_cols = st.columns(6)
-    if otc_row is not None:
-        nav_col = next((col for col in otc_row.index if "单位净值" in str(col)), None)
-        otc_header_cols[0].metric("最新单位净值", f"{to_num(otc_row.get(nav_col)):.4f}" if nav_col else "-")
-        otc_header_cols[1].metric("日增长率", pct_text(to_num(otc_row.get("日增长率"))))
-        otc_header_cols[2].metric("估算净值", f"{to_num(otc_raw.get('estimated_nav')):.4f}" if pd.notna(to_num(otc_raw.get("estimated_nav"))) else "-")
-        otc_header_cols[3].metric("估算涨幅", pct_text(to_num(otc_raw.get("estimate_pct"))), delta=f"偏差 {pct_text(to_num(otc_raw.get('estimate_bias')))}")
-        otc_header_cols[4].metric("同类估算分位", pct_text(to_num(otc_raw.get("peer_rank")), 1))
-        otc_header_cols[5].metric("申/赎状态", f"{otc_row.get('申购状态', '-')} / {otc_row.get('赎回状态', '-')}")
-    else:
-        for col, label in zip(otc_header_cols, ["最新单位净值", "日增长率", "估算净值", "估算涨幅", "同类估算分位", "申/赎状态"]):
-            col.metric(label, "-")
+    nav_col = next((col for col in otc_row.index if "单位净值" in str(col)), None) if otc_row is not None else None
+    latest_unit_nav = to_num(otc_row.get(nav_col)) if otc_row is not None and nav_col else np.nan
+    if pd.isna(latest_unit_nav) and otc_model["price_df"] is not None and not otc_model["price_df"].empty:
+        latest_unit_nav = to_num(otc_model["price_df"]["close"].iloc[-1])
+    daily_pct_value = to_num(otc_row.get("日增长率")) if otc_row is not None else to_num(otc_raw.get("daily_pct"))
+    through_nav_value = to_num(otc_raw.get("through_nav"))
+    if pd.isna(through_nav_value):
+        through_nav_value = to_num(otc_raw.get("estimated_nav"))
+    through_pct_value = to_num(otc_raw.get("through_pct"))
+    if pd.isna(through_pct_value):
+        through_pct_value = to_num(otc_raw.get("estimate_pct"))
+    otc_header_cols[0].metric("最新单位净值", f"{latest_unit_nav:.4f}" if pd.notna(latest_unit_nav) else "-")
+    otc_header_cols[1].metric("日增长率", pct_text(daily_pct_value))
+    otc_header_cols[2].metric("实时穿透净值", f"{through_nav_value:.4f}" if pd.notna(through_nav_value) else "-")
+    otc_header_cols[3].metric("实时穿透涨幅", pct_text(through_pct_value), delta=f"估算偏差 {pct_text(to_num(otc_raw.get('estimate_bias')))}")
+    otc_header_cols[4].metric("同类/热度分位", pct_text(to_num(otc_raw.get("peer_rank")), 1))
+    otc_header_cols[5].metric("申/赎状态", f"{otc_row.get('申购状态', '-') if otc_row is not None else '-'} / {otc_row.get('赎回状态', '-') if otc_row is not None else '-'}")
 
     otc_tabs = st.tabs(["机会评分", "净值与动量", "资金与穿透", "板块与市场", "持仓与资产", "自选池/查询", "模型"])
 
@@ -2522,12 +2585,13 @@ if fund_mode == "场外基金":
             else:
                 st.write("暂无明显负向信号。")
 
-        otc_detail_cols = st.columns(5)
+        otc_detail_cols = st.columns(6)
         otc_detail_cols[0].metric("近5日净值", pct_text(to_num(otc_raw.get("ret5"))))
         otc_detail_cols[1].metric("近20日净值", pct_text(to_num(otc_raw.get("ret20"))))
-        otc_detail_cols[2].metric("重仓估算贡献", pct_text(to_num(otc_raw.get("holding_contribution"))))
-        otc_detail_cols[3].metric("前20持仓权重", pct_text(to_num(otc_raw.get("top_weight"))))
-        otc_detail_cols[4].metric("120日回撤", pct_text(to_num(otc_raw.get("drawdown120"))))
+        otc_detail_cols[2].metric("实时穿透涨幅", pct_text(to_num(otc_raw.get("through_pct"))))
+        otc_detail_cols[3].metric("重仓估算贡献", pct_text(to_num(otc_raw.get("holding_contribution"))))
+        otc_detail_cols[4].metric("前20持仓权重", pct_text(to_num(otc_raw.get("top_weight"))))
+        otc_detail_cols[5].metric("120日回撤", pct_text(to_num(otc_raw.get("drawdown120"))))
 
         st.subheader("场外自选基金短线操作评分排行")
         if otc_watchlist_table.empty:
@@ -2581,18 +2645,24 @@ if fund_mode == "场外基金":
             tech_cols[9].metric("120日回撤", pct_text(to_num(otc_raw.get("drawdown120"))))
         else:
             st.plotly_chart(nav_trend_chart(otc_nav_df, f"{otc_code} {otc_name}：单位净值走势"), use_container_width=True)
-        st.caption("场外基金没有盘中成交额，净值动量使用公开净值序列、阶段业绩和同类排名替代场内量价结构。")
+        st.caption("净值动量会把后台快照里的实时穿透净值追加为最新点；DIF、DEA、MACD柱因此会反映当天重仓股穿透估算。")
 
     with otc_tabs[2]:
         st.subheader("重仓股实时穿透")
-        impact_cols = st.columns(4)
+        impact_cols = st.columns(5)
         impact_cols[0].metric("重仓股估算贡献", pct_text(otc_estimated_contribution))
+        impact_cols[1].metric("实时穿透涨幅", pct_text(to_num(otc_raw.get("through_pct"))))
+        impact_cols[2].metric("实时穿透净值", f"{to_num(otc_raw.get('through_nav')):.4f}" if pd.notna(to_num(otc_raw.get("through_nav"))) else "-")
         if otc_holding_impact is not None and not otc_holding_impact.empty and "占净值比例" in otc_holding_impact:
-            impact_cols[1].metric("前20持仓权重", pct_text(otc_holding_impact["占净值比例"].dropna().sum()))
+            impact_cols[3].metric("前20持仓权重", pct_text(otc_holding_impact["占净值比例"].dropna().sum()))
+        else:
+            impact_cols[3].metric("前20持仓权重", pct_text(to_num(otc_raw.get("top_weight"))))
         if otc_holding_impact is not None and not otc_holding_impact.empty and "涨跌幅" in otc_holding_impact:
-            impact_cols[2].metric("上涨重仓股数", f"{int((otc_holding_impact['涨跌幅'] > 0).sum())}")
+            impact_cols[4].metric("上涨重仓股数", f"{int((otc_holding_impact['涨跌幅'] > 0).sum())}")
+        else:
+            impact_cols[4].metric("上涨重仓比例", pct_text(to_num(otc_raw.get("holding_up_ratio"))))
         if otc_holding_impact is not None and not otc_holding_impact.empty and "主力净流入-净额" in otc_holding_impact:
-            impact_cols[3].metric("重仓主力净额", format_money(numeric_series(otc_holding_impact["主力净流入-净额"]).sum()))
+            st.metric("重仓主力净额", format_money(numeric_series(otc_holding_impact["主力净流入-净额"]).sum()))
         if otc_holding_impact is not None and not otc_holding_impact.empty:
             display_impact = otc_holding_impact.copy()
             for col in ["占净值比例", "涨跌幅", "估算贡献"]:
@@ -2604,7 +2674,7 @@ if fund_mode == "场外基金":
             keep_cols = ["股票代码", "股票名称", "占净值比例", "最新价", "涨跌幅", "估算贡献", "成交额", "主力净流入-净额", "季度"]
             st.dataframe(display_impact[[col for col in keep_cols if col in display_impact.columns]], use_container_width=True, hide_index=True)
         else:
-            st.write("未取得重仓股持仓。")
+            st.write("未展开逐股持仓表；上方指标来自后台快照的重仓股穿透估算。")
 
         st.subheader("穿透解释")
         st.write("场外基金没有交易所盘口和逐笔成交，资金确认使用公开重仓股实时涨跌、重仓主力净额、上涨重仓股比例和持仓权重集中度作为代理。")
