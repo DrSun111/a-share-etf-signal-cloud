@@ -73,16 +73,28 @@ GitHub 可以保存和管理代码，但 GitHub Pages 不能直接运行 Python/
 
 场外基金可点击侧边栏「同步场外自选快照入库」，或运行 `run_otc_collector.ps1` 后台持续刷新。打开「场外自选优先读后台快照」后，场外自选池和评分排行会优先读取 `otc_watch_snapshot`，页面加载会明显更快。
 
+长期手机端使用建议接 PostgreSQL 云数据库。把同一条 `DATABASE_URL` 同时配置到 Streamlit Cloud App Secrets 和 GitHub Actions Secrets，前台看板和后台采集任务就会读写同一个数据库。关闭网页后数据不会丢；如果只使用 Streamlit Cloud 本机 SQLite，实例重启后快照可能消失。
+
+本地已有快照可迁移到云数据库：
+
+```powershell
+$env:DATABASE_URL="postgresql://USER:PASSWORD@HOST:5432/DBNAME"
+python db_admin.py init
+python db_admin.py migrate-sqlite
+python db_admin.py summary
+```
+
 如需云端 GitHub Actions 在还没有数据库自选池时先跑起来，可在仓库 Variables 或 Secrets 里配置：
 
 ```text
-OTC_WATCHLIST_CODES=019172,011036
+OTC_WATCHLIST_CODES=025857,110022,018345
+ETF_WATCHLIST_CODES=510300,159915
 ```
 
-云端部署时，在 Streamlit Cloud 或 GitHub Actions Secrets 中配置：
+也可以手动写入自选池：
 
-```text
-DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DBNAME
+```powershell
+python db_admin.py seed-watchlist --otc "025857 110022 018345"
 ```
 
 然后用 `collector.py`、`otc_collector.py` 或 GitHub Actions 定时写入数据库，手机端看板读取数据库即可。
