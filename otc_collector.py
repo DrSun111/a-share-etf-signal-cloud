@@ -644,7 +644,7 @@ def collect_otc_watch_snapshot(codes: list[str] | str | None = None) -> dict[str
     errors: list[str] = []
     rows_by_code: dict[str, dict[str, Any]] = {}
 
-    def collect_one(code: str) -> tuple[str, dict[str, Any] | None, str | None]:
+    def collect_one(code: str) -> tuple[str, dict[str, Any] | None, pd.DataFrame | None, str | None]:
         try:
             daily_row = latest_row(daily_df, code)
             name_row = latest_row(names_df, code)
@@ -655,7 +655,7 @@ def collect_otc_watch_snapshot(codes: list[str] | str | None = None) -> dict[str
             if (fund_spot is None or fund_spot.empty) and holdings_df is not None and not holdings_df.empty and "股票代码" in holdings_df.columns:
                 fund_spot = get_sina_holding_quotes(holdings_df["股票代码"].astype(str).head(20).tolist())
             _, metrics = holding_impact(holdings_df, fund_spot)
-            return code, score_watch_item(code, daily_row, name_row, est_row, estimation_df, daily_df, nav_df, metrics), None
+            return code, score_watch_item(code, daily_row, name_row, est_row, estimation_df, daily_df, nav_df, metrics), nav_df, None
         except Exception as exc:  # noqa: BLE001 - keep other watchlist rows usable.
             return (
                 code,
@@ -667,16 +667,20 @@ def collect_otc_watch_snapshot(codes: list[str] | str | None = None) -> dict[str
                     "快照时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "数据来源": f"采集失败：{type(exc).__name__}: {exc}",
                 },
+                None,
                 f"{code}: {type(exc).__name__}: {exc}",
             )
 
     max_workers = max(1, min(6, len(clean_codes)))
+    nav_by_code: dict[str, pd.DataFrame] = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(collect_one, code): code for code in clean_codes}
         for future in as_completed(futures):
-            code, row, error = future.result()
+            code, row, nav_df, error = future.result()
             if row is not None:
                 rows_by_code[code] = row
+            if nav_df is not None and not nav_df.empty:
+                nav_by_code[code] = nav_df
             if error:
                 errors.append(error)
 
@@ -684,13 +688,21 @@ def collect_otc_watch_snapshot(codes: list[str] | str | None = None) -> dict[str
     out = pd.DataFrame(rows)
     if not out.empty and "场外短线评分" in out.columns:
         out = out.sort_values("场外短线评分", ascending=False, na_position="last").reset_index(drop=True)
-    from db_store import save_otc_watch_snapshot
+    from db_store import save_otc_nav_history, save_otc_watch_snapshot
 
     result = save_otc_watch_snapshot(out)
+    nav_saved = 0
+    nav_records = 0
+    for nav_code, nav_df in nav_by_code.items():
+        nav_result = save_otc_nav_history(nav_code, nav_df, snapshot_ts=result["snapshot_ts"])
+        nav_saved += int(nav_result.get("rows", 0) or 0)
+        nav_records += int(nav_result.get("records", 0) or 0)
     result.update(
         {
             "codes": clean_codes,
             "rows": len(out),
+            "nav_saved": nav_saved,
+            "nav_records": nav_records,
             "elapsed_seconds": round(time.perf_counter() - started, 2),
             "errors": errors,
             "sources": [daily_status, names_status, estimation_status, a_spot_status],
