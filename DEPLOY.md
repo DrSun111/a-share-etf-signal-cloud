@@ -19,17 +19,51 @@ GitHub Pages 只能托管静态 HTML/CSS/JavaScript，不能直接运行 Python/
 DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DBNAME
 ```
 
-在 Streamlit Community Cloud 的 App Secrets 中加入同名配置。App 会自动使用云数据库；本地没有 `DATABASE_URL` 时，会回退到 `data/etf_signal.db` SQLite 文件。
+同一条 `DATABASE_URL` 要配置到两个地方：
+
+1. Streamlit Community Cloud -> App -> Settings -> Secrets，用于手机端看板读取云数据库。
+2. GitHub 仓库 -> Settings -> Secrets and variables -> Actions -> Secrets，用于 GitHub Actions 定时写入云数据库。
+
+App 会自动使用云数据库；本地没有 `DATABASE_URL` 时，会回退到 `data/etf_signal.db` SQLite 文件。注意：Streamlit Cloud 上的本地 SQLite 不适合长期保存，实例重启后可能丢失；长期手机端使用必须接云数据库。
+
+本地已有 SQLite 快照时，可一次性迁移到云数据库：
+
+```powershell
+$env:DATABASE_URL="postgresql://USER:PASSWORD@HOST:5432/DBNAME"
+python db_admin.py init
+python db_admin.py migrate-sqlite
+python db_admin.py summary
+```
+
+如需先把自选池写入云数据库：
+
+```powershell
+python db_admin.py seed-watchlist --otc "025857 110022 018345"
+```
 
 ## 定时采集
 
-本目录包含 `.github/workflows/collect.yml`。把项目推到 GitHub 后，在仓库 `Settings -> Secrets and variables -> Actions` 添加 `DATABASE_URL`，GitHub Actions 就可以每 30 分钟运行一次：
+本目录包含 `.github/workflows/collect.yml`。把项目推到 GitHub 后，在仓库 `Settings -> Secrets and variables -> Actions` 添加：
 
-```powershell
-python collector.py
+```text
+DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DBNAME
+OTC_WATCHLIST_CODES=025857,110022,018345
+ETF_WATCHLIST_CODES=510300,159915
 ```
 
-它会抓取 ETF 实时行情和行业热度，并写入数据库。手机端看板开启「优先读取数据库快照」后，会优先读取最近一次入库快照。
+其中 `DATABASE_URL` 建议放到 Secrets；`OTC_WATCHLIST_CODES` 和 `ETF_WATCHLIST_CODES` 可放到 Variables 或 Secrets。GitHub Actions 会在 A 股交易时段每 30 分钟运行一次，也可以在 Actions 页面手动点 `Run workflow`，临时输入一组场外基金代码。
+
+工作流会依次执行：
+
+```powershell
+python db_admin.py init
+python db_admin.py seed-watchlist
+python collector.py
+python otc_collector.py
+python db_admin.py summary
+```
+
+它会抓取 ETF 实时行情、行业热度和场外自选基金快照，并写入数据库。手机端看板开启「优先读取数据库快照」「场外自选优先读后台快照」后，会优先读取最近一次入库快照，页面刷新会快很多。
 
 官方文档：
 
