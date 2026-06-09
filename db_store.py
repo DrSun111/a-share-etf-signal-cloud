@@ -282,6 +282,38 @@ def _load_latest_payloads(table: str) -> tuple[pd.DataFrame | None, dict[str, An
     return pd.DataFrame(records), {"ok": True, "label": f"{table}-数据库", "detail": f"{len(records):,} 行，快照 {latest}"}
 
 
+def _load_latest_payloads_by_code(table: str) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    init_db()
+    latest = _latest_ts(table)
+    if not latest:
+        return None, {"ok": False, "label": f"{table}-数据库", "detail": "暂无快照"}
+
+    sql = f"""
+        SELECT t.payload_json
+        FROM {table} t
+        JOIN (
+            SELECT code, MAX(snapshot_ts) AS snapshot_ts
+            FROM {table}
+            GROUP BY code
+        ) latest
+          ON t.code = latest.code AND t.snapshot_ts = latest.snapshot_ts
+        ORDER BY t.snapshot_ts DESC, t.code
+    """
+    url = database_url()
+    if is_sqlite_url(url):
+        with _sqlite_conn(url) as conn:
+            rows = conn.execute(sql).fetchall()
+    else:
+        from sqlalchemy import text
+
+        engine = _pg_engine(url)
+        with engine.begin() as conn:
+            rows = conn.execute(text(sql)).fetchall()
+
+    records = [json.loads(row[0]) for row in rows]
+    return pd.DataFrame(records), {"ok": True, "label": f"{table}-数据库", "detail": f"{len(records):,} 只基金，每只取最新快照；最新 {latest}"}
+
+
 def load_latest_etf_spot() -> tuple[pd.DataFrame | None, dict[str, Any]]:
     return _load_latest_payloads("etf_spot_snapshot")
 
@@ -291,7 +323,7 @@ def load_latest_sector_heat() -> tuple[pd.DataFrame | None, dict[str, Any]]:
 
 
 def load_latest_otc_watch_snapshot() -> tuple[pd.DataFrame | None, dict[str, Any]]:
-    return _load_latest_payloads("otc_watch_snapshot")
+    return _load_latest_payloads_by_code("otc_watch_snapshot")
 
 
 def save_watchlist(codes: list[str], owner: str = "default") -> int:
