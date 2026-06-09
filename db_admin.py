@@ -42,6 +42,16 @@ def normalize_code_list(raw: Any) -> list[str]:
     return codes
 
 
+def load_codes_from_json_file(filename: str) -> list[str]:
+    path = db_store.APP_DIR / filename
+    if not path.exists():
+        return []
+    try:
+        return normalize_code_list(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
 def print_json(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
 
@@ -108,11 +118,19 @@ def command_init(_: argparse.Namespace) -> dict[str, Any]:
 def command_seed_watchlist(args: argparse.Namespace) -> dict[str, Any]:
     etf_codes = normalize_code_list(args.etf or os.environ.get("ETF_WATCHLIST_CODES"))
     otc_codes = normalize_code_list(args.otc or os.environ.get("OTC_WATCHLIST_CODES"))
+    etf_source = "args/env" if etf_codes else "watchlist.json"
+    otc_source = "args/env" if otc_codes else "otc_watchlist.json"
+    if not etf_codes:
+        etf_codes = load_codes_from_json_file("watchlist.json")
+    if not otc_codes:
+        otc_codes = load_codes_from_json_file("otc_watchlist.json")
     result: dict[str, Any] = {
         "ok": True,
         "database": db_store.masked_database_url(),
         "etf_codes": etf_codes,
         "otc_codes": otc_codes,
+        "etf_source": etf_source if etf_codes else "none",
+        "otc_source": otc_source if otc_codes else "none",
     }
     if etf_codes:
         result["etf_saved"] = db_store.save_watchlist(etf_codes, owner="default")
