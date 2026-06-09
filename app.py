@@ -142,6 +142,20 @@ def extract_code_from_label(label: str) -> str:
     return match.group(1) if match else ""
 
 
+def select_code_from_label_widget(widget_key: str, state_key: str, clear_key: str | None = None) -> None:
+    code = extract_code_from_label(str(st.session_state.get(widget_key, "")))
+    if code:
+        st.session_state[state_key] = code
+        if clear_key:
+            st.session_state[clear_key] = ""
+
+
+def select_code_from_text_widget(widget_key: str, state_key: str) -> None:
+    code = maybe_clean_code(str(st.session_state.get(widget_key, "")))
+    if code:
+        st.session_state[state_key] = code
+
+
 def normalize_code_list(raw: Any) -> list[str]:
     if raw is None:
         return []
@@ -2364,10 +2378,29 @@ with st.sidebar:
             if extract_code_from_label(option) == current_otc_code:
                 otc_selected_index = idx
                 break
-        otc_option = st.selectbox("场外基金列表", otc_options, index=otc_selected_index)
-        otc_manual_code = st.text_input("场外基金手动代码", value="", placeholder="可选：直接输入6位代码")
-        otc_code = clean_code(otc_manual_code) if maybe_clean_code(otc_manual_code) else (extract_code_from_label(otc_option) or current_otc_code)
-        st.session_state["selected_otc_code"] = otc_code
+        current_otc_option = otc_options[otc_selected_index]
+        if (
+            st.session_state.get("sidebar_otc_fund_select") not in otc_options
+            or extract_code_from_label(st.session_state.get("sidebar_otc_fund_select", "")) != current_otc_code
+        ):
+            st.session_state["sidebar_otc_fund_select"] = current_otc_option
+        st.selectbox(
+            "场外基金列表",
+            otc_options,
+            key="sidebar_otc_fund_select",
+            on_change=select_code_from_label_widget,
+            args=("sidebar_otc_fund_select", "selected_otc_code", "otc_manual_code"),
+        )
+        if "otc_manual_code" not in st.session_state:
+            st.session_state["otc_manual_code"] = ""
+        st.text_input(
+            "场外基金手动代码",
+            placeholder="可选：直接输入6位代码，回车后切换",
+            key="otc_manual_code",
+            on_change=select_code_from_text_widget,
+            args=("otc_manual_code", "selected_otc_code"),
+        )
+        otc_code = clean_code(st.session_state.get("selected_otc_code", current_otc_code))
 
         otc_add_col, otc_focus_col = st.columns(2)
         with otc_add_col:
@@ -2394,11 +2427,13 @@ with st.sidebar:
                 or extract_code_from_label(st.session_state.get("sidebar_otc_watch_focus", "")) != current_focus_code
             ):
                 st.session_state["sidebar_otc_watch_focus"] = current_focus_label
-            focus_otc_label = st.selectbox("点击自选基金查看分析", otc_watchlist_label_options, index=focus_index, key="sidebar_otc_watch_focus")
-            focus_otc_code = extract_code_from_label(focus_otc_label)
-            if focus_otc_code and focus_otc_code != current_focus_code:
-                st.session_state["selected_otc_code"] = focus_otc_code
-                st.rerun()
+            st.selectbox(
+                "点击自选基金查看分析",
+                otc_watchlist_label_options,
+                key="sidebar_otc_watch_focus",
+                on_change=select_code_from_label_widget,
+                args=("sidebar_otc_watch_focus", "selected_otc_code", "otc_manual_code"),
+            )
         otc_save_col, otc_clear_col = st.columns(2)
         with otc_save_col:
             if st.button("保存场外自选", use_container_width=True):
@@ -2641,11 +2676,19 @@ if fund_mode == "场外基金":
                     if extract_code_from_label(label) == otc_code:
                         current_rank_index = idx
                         break
-                chosen_rank_label = st.selectbox("点击排行基金查看分析", rank_labels, index=current_rank_index, key="otc_rank_click_select")
-                chosen_rank_code = extract_code_from_label(chosen_rank_label)
-                if chosen_rank_code and chosen_rank_code != otc_code:
-                    st.session_state["selected_otc_code"] = chosen_rank_code
-                    st.rerun()
+                current_rank_label = rank_labels[current_rank_index]
+                if (
+                    st.session_state.get("otc_rank_click_select") not in rank_labels
+                    or extract_code_from_label(st.session_state.get("otc_rank_click_select", "")) != otc_code
+                ):
+                    st.session_state["otc_rank_click_select"] = current_rank_label
+                st.selectbox(
+                    "点击排行基金查看分析",
+                    rank_labels,
+                    key="otc_rank_click_select",
+                    on_change=select_code_from_label_widget,
+                    args=("otc_rank_click_select", "selected_otc_code", "otc_manual_code"),
+                )
             st.dataframe(format_open_fund_display(rank_df), use_container_width=True, hide_index=True)
 
     with otc_tabs[1]:
@@ -2765,11 +2808,13 @@ if fund_mode == "场外基金":
                     or extract_code_from_label(st.session_state.get("otc_watchlist_click_select", "")) != otc_code
                 ):
                     st.session_state["otc_watchlist_click_select"] = current_watch_label
-                chosen_otc_watch = st.selectbox("点击自选基金查看分析", otc_watch_labels, index=current_watch_index, key="otc_watchlist_click_select")
-                chosen_otc_code = extract_code_from_label(chosen_otc_watch)
-                if chosen_otc_code and chosen_otc_code != otc_code:
-                    st.session_state["selected_otc_code"] = chosen_otc_code
-                    st.rerun()
+                st.selectbox(
+                    "点击自选基金查看分析",
+                    otc_watch_labels,
+                    key="otc_watchlist_click_select",
+                    on_change=select_code_from_label_widget,
+                    args=("otc_watchlist_click_select", "selected_otc_code", "otc_manual_code"),
+                )
                 st.dataframe(format_open_fund_display(otc_watchlist_table), use_container_width=True, hide_index=True)
         with browse_right:
             st.subheader("开放式基金查询")
