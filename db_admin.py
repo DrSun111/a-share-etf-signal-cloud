@@ -16,6 +16,7 @@ TABLES = [
     "sector_heat_snapshot",
     "score_snapshot",
     "otc_watch_snapshot",
+    "otc_nav_history",
     "watchlist",
 ]
 
@@ -24,6 +25,7 @@ KEY_COLUMNS = {
     "sector_heat_snapshot": ("snapshot_ts", "sector"),
     "score_snapshot": ("snapshot_ts", "code"),
     "otc_watch_snapshot": ("snapshot_ts", "code"),
+    "otc_nav_history": ("code",),
     "watchlist": ("owner", "code"),
 }
 
