@@ -387,6 +387,50 @@ def get_fund_names_from_collector_cache() -> tuple[pd.DataFrame | None, dict[str
     return out, data_status("全部基金名称-本地后台缓存", True, f"{len(out):,} 行，约 {int(age.total_seconds())} 秒前")
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def get_open_fund_daily_from_collector_cache() -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    path = APP_DIR / "data" / "vendor_cache" / "open_fund_daily.pkl"
+    if not path.exists():
+        return None, data_status("开放式基金净值-本地后台缓存", False, "暂无本地缓存")
+    try:
+        df = pd.read_pickle(path)
+    except Exception as exc:  # noqa: BLE001
+        return None, data_status("开放式基金净值-本地后台缓存", False, f"{type(exc).__name__}: {exc}")
+    if df is None or df.empty:
+        return None, data_status("开放式基金净值-本地后台缓存", False, "缓存为空")
+    out = df.copy()
+    if "基金代码" in out.columns:
+        out["基金代码"] = out["基金代码"].astype(str).str.zfill(6)
+    for col in ["日增长值", "日增长率"]:
+        if col in out.columns:
+            out[col] = numeric_series(out[col])
+    for col in [col for col in out.columns if "单位净值" in str(col) or "累计净值" in str(col)]:
+        out[col] = numeric_series(out[col])
+    age = datetime.now() - datetime.fromtimestamp(path.stat().st_mtime)
+    return out, data_status("开放式基金净值-本地后台缓存", True, f"{len(out):,} 行，约 {int(age.total_seconds())} 秒前")
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_open_fund_estimation_from_collector_cache() -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    path = APP_DIR / "data" / "vendor_cache" / "open_fund_estimation.pkl"
+    if not path.exists():
+        return None, data_status("场外基金盘中估值-本地后台缓存", False, "暂无本地缓存")
+    try:
+        df = pd.read_pickle(path)
+    except Exception as exc:  # noqa: BLE001
+        return None, data_status("场外基金盘中估值-本地后台缓存", False, f"{type(exc).__name__}: {exc}")
+    if df is None or df.empty:
+        return None, data_status("场外基金盘中估值-本地后台缓存", False, "缓存为空")
+    out = df.copy()
+    if "基金代码" in out.columns:
+        out["基金代码"] = out["基金代码"].astype(str).str.zfill(6)
+    for col in ["估算净值", "估算涨幅", "公布单位净值", "公布日增长率", "估算偏差", "上一净值"]:
+        if col in out.columns:
+            out[col] = numeric_series(out[col])
+    age = datetime.now() - datetime.fromtimestamp(path.stat().st_mtime)
+    return out, data_status("场外基金盘中估值-本地后台缓存", True, f"{len(out):,} 行，约 {int(age.total_seconds())} 秒前")
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def get_open_fund_estimation() -> tuple[pd.DataFrame | None, dict[str, Any]]:
     df, status = run_call("场外基金盘中估值-东方财富", ak.fund_value_estimation_em)
@@ -2253,6 +2297,10 @@ with st.sidebar:
         horizontal=True,
     )
     st.session_state["fund_mode"] = fund_mode
+    fast_refresh_mode = st.toggle("极速刷新模式", value=st.session_state.get("fast_refresh_mode", True))
+    st.session_state["fast_refresh_mode"] = fast_refresh_mode
+    load_deep_details = st.toggle("加载深度资料", value=st.session_state.get("load_deep_details", False))
+    st.session_state["load_deep_details"] = load_deep_details
     db_read_mode = st.toggle("优先读取数据库快照", value=st.session_state.get("db_read_mode", False))
     st.session_state["db_read_mode"] = db_read_mode
     otc_snapshot_mode = st.toggle("场外自选优先读后台快照", value=st.session_state.get("otc_snapshot_mode", True))
@@ -2283,11 +2331,11 @@ with st.sidebar:
 
 if fund_mode == "场外基金" and otc_snapshot_mode:
     etf_spot, spot_status = None, data_status("ETF实时行情-东方财富", True, "场外后台快照模式已跳过")
-elif db_read_mode:
+elif db_read_mode or fast_refresh_mode:
     etf_spot, spot_status = get_etf_spot_from_db()
     if etf_spot is None:
         live_spot, live_status = get_etf_spot()
-        etf_spot, spot_status = live_spot, {"ok": live_status.get("ok"), "label": "数据库为空，已回退实时ETF行情", "detail": live_status.get("detail")}
+        etf_spot, spot_status = live_spot, {"ok": live_status.get("ok"), "label": "快照为空，已回退实时ETF行情", "detail": live_status.get("detail")}
 else:
     etf_spot, spot_status = get_etf_spot()
 
@@ -2309,6 +2357,17 @@ if fund_mode == "场外基金":
             fund_names, fund_names_status = get_fund_names_from_collector_cache()
             open_fund_estimation = None
             open_fund_estimation_status = data_status("场外基金盘中估值-东方财富", True, "已使用后台快照，前台跳过全量估算表")
+    elif fast_refresh_mode:
+        with st.spinner("正在读取场外基金缓存..."):
+            open_fund_daily, open_fund_daily_status = get_open_fund_daily_from_collector_cache()
+            if open_fund_daily is None:
+                open_fund_daily, open_fund_daily_status = get_open_fund_daily()
+            fund_names, fund_names_status = get_fund_names_from_collector_cache()
+            if fund_names is None:
+                fund_names, fund_names_status = get_fund_names()
+            open_fund_estimation, open_fund_estimation_status = get_open_fund_estimation_from_collector_cache()
+            if open_fund_estimation is None:
+                open_fund_estimation, open_fund_estimation_status = get_open_fund_estimation()
     else:
         with st.spinner("正在读取场外基金列表..."):
             open_fund_daily, open_fund_daily_status = get_open_fund_daily()
@@ -2463,9 +2522,14 @@ with st.spinner("正在读取实时数据..."):
     index_df, index_statuses = get_index_daily(index_symbol, start_str, end_str)
     if fund_mode == "场内ETF":
         daily_df, daily_statuses = get_etf_daily(code, start_str, end_str)
-        overview_df, overview_status = get_fund_overview(code)
-        nav_df, nav_status = get_fund_nav(code, start_str, end_str)
-        holdings_df, holdings_statuses = get_holdings(code)
+        if fast_refresh_mode and not load_deep_details:
+            overview_df, overview_status = None, data_status("基金概况-东方财富", True, "极速模式已跳过")
+            nav_df, nav_status = None, data_status("ETF净值-东方财富", True, "极速模式已跳过")
+            holdings_df, holdings_statuses = None, [data_status("成分持仓", True, "极速模式已跳过")]
+        else:
+            overview_df, overview_status = get_fund_overview(code)
+            nav_df, nav_status = get_fund_nav(code, start_str, end_str)
+            holdings_df, holdings_statuses = get_holdings(code)
         otc_nav_df, otc_nav_status = None, data_status("场外基金净值", True, "场内模式未读取")
         otc_basic_df, otc_basic_status = None, data_status("场外基金基本信息", True, "场内模式未读取")
         otc_achievement_df, otc_achievement_status = None, data_status("场外基金业绩", True, "场内模式未读取")
@@ -2482,25 +2546,36 @@ with st.spinner("正在读取实时数据..."):
             otc_achievement_df, otc_achievement_status = None, data_status("场外基金业绩", True, "后台快照极速模式已跳过")
             otc_asset_df, otc_asset_status = None, data_status("场外基金资产配置", True, "后台快照极速模式已跳过")
             otc_holdings_df, otc_holdings_statuses = None, [data_status("场外基金股票持仓", True, "后台快照极速模式已跳过")]
+        elif fast_refresh_mode and not load_deep_details:
+            otc_nav_df, otc_nav_status = get_open_fund_nav_from_collector_cache(otc_code)
+            if otc_nav_df is None:
+                otc_nav_df, otc_nav_status = get_open_fund_nav_trend(otc_code)
+            otc_basic_df, otc_basic_status = None, data_status("场外基金基本信息", True, "极速模式已跳过")
+            otc_achievement_df, otc_achievement_status = None, data_status("场外基金业绩", True, "极速模式已跳过")
+            otc_asset_df, otc_asset_status = None, data_status("场外基金资产配置", True, "极速模式已跳过")
+            otc_holdings_df, otc_holdings_statuses = None, [data_status("场外基金股票持仓", True, "极速模式已跳过")]
         else:
             otc_nav_df, otc_nav_status = get_open_fund_nav_trend(otc_code)
             otc_basic_df, otc_basic_status = get_open_fund_basic(otc_code)
             otc_achievement_df, otc_achievement_status = get_open_fund_achievement(otc_code)
             otc_asset_df, otc_asset_status = get_open_fund_asset_allocation(otc_code)
             otc_holdings_df, otc_holdings_statuses = get_open_fund_holdings(otc_code)
-    if db_read_mode:
+    if db_read_mode or fast_refresh_mode:
         sector_df, sector_status = get_sector_summary_from_db()
         if sector_df is None:
-            live_sector_df, live_sector_status = get_sector_summary()
-            sector_df, sector_status = live_sector_df, {"ok": live_sector_status.get("ok"), "label": "数据库为空，已回退实时行业热度", "detail": live_sector_status.get("detail")}
+            if fast_refresh_mode:
+                sector_df, sector_status = None, data_status("行业热度-数据库", True, "极速模式已跳过实时行业接口")
+            else:
+                live_sector_df, live_sector_status = get_sector_summary()
+                sector_df, sector_status = live_sector_df, {"ok": live_sector_status.get("ok"), "label": "数据库为空，已回退实时行业热度", "detail": live_sector_status.get("detail")}
     elif use_otc_fast_snapshot:
         sector_df, sector_status = get_sector_summary_from_db()
         if sector_df is None:
             sector_df, sector_status = None, data_status("行业热度-数据库", True, "后台快照极速模式已跳过实时行业接口")
     else:
         sector_df, sector_status = get_sector_summary()
-    if use_otc_fast_snapshot:
-        a_spot, a_spot_status = None, data_status("A股实时行情-东方财富", True, "后台快照极速模式已跳过")
+    if use_otc_fast_snapshot or fast_refresh_mode:
+        a_spot, a_spot_status = None, data_status("A股实时行情-东方财富", True, "极速模式已跳过")
     else:
         a_spot, a_spot_status = get_a_spot()
 
