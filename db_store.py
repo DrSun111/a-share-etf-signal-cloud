@@ -128,6 +128,13 @@ def init_db() -> None:
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS otc_nav_history (
+            code TEXT NOT NULL,
+            snapshot_ts TEXT NOT NULL,
+            payload_json TEXT NOT NULL
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS watchlist (
             owner TEXT NOT NULL,
             code TEXT NOT NULL,
@@ -140,6 +147,7 @@ def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_score_snapshot_code_ts ON score_snapshot (code, snapshot_ts)",
         "CREATE INDEX IF NOT EXISTS idx_otc_watch_snapshot_ts ON otc_watch_snapshot (snapshot_ts)",
         "CREATE INDEX IF NOT EXISTS idx_otc_watch_snapshot_code_ts ON otc_watch_snapshot (code, snapshot_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_otc_nav_history_code_ts ON otc_nav_history (code, snapshot_ts)",
         "CREATE INDEX IF NOT EXISTS idx_watchlist_owner_code ON watchlist (owner, code)",
     ]
     for statement in statements:
@@ -252,6 +260,44 @@ def save_otc_watch_snapshot(df: pd.DataFrame, snapshot_ts: str | None = None) ->
     return {"table": "otc_watch_snapshot", "snapshot_ts": snapshot_ts, "rows": _insert_rows("otc_watch_snapshot", rows)}
 
 
+def save_otc_nav_history(code: str, df: pd.DataFrame | None, snapshot_ts: str | None = None) -> dict[str, Any]:
+    init_db()
+    code = "".join(ch for ch in str(code or "") if ch.isdigit())[-6:].zfill(6)
+    if not code or df is None or df.empty:
+        return {"table": "otc_nav_history", "snapshot_ts": snapshot_ts or now_iso(), "rows": 0, "records": 0}
+
+    snapshot_ts = snapshot_ts or now_iso()
+    records = _json_ready_records(df)
+    row = {
+        "code": code,
+        "snapshot_ts": snapshot_ts,
+        "payload_json": json.dumps(records, ensure_ascii=False, default=str),
+    }
+    url = database_url()
+    if is_sqlite_url(url):
+        with _sqlite_conn(url) as conn:
+            conn.execute("DELETE FROM otc_nav_history WHERE code = ?", (code,))
+            conn.execute(
+                "INSERT INTO otc_nav_history (code, snapshot_ts, payload_json) VALUES (?, ?, ?)",
+                (row["code"], row["snapshot_ts"], row["payload_json"]),
+            )
+            conn.commit()
+    else:
+        from sqlalchemy import text
+
+        engine = _pg_engine(url)
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM otc_nav_history WHERE code = :code"), {"code": code})
+            conn.execute(
+                text(
+                    "INSERT INTO otc_nav_history (code, snapshot_ts, payload_json) "
+                    "VALUES (:code, :snapshot_ts, :payload_json)"
+                ),
+                row,
+            )
+    return {"table": "otc_nav_history", "snapshot_ts": snapshot_ts, "rows": 1, "records": len(records)}
+
+
 def _latest_ts(table: str) -> str | None:
     init_db()
     sql = f"SELECT MAX(snapshot_ts) AS snapshot_ts FROM {table}"
@@ -333,6 +379,36 @@ def load_latest_otc_watch_snapshot() -> tuple[pd.DataFrame | None, dict[str, Any
     return _load_latest_payloads_by_code("otc_watch_snapshot")
 
 
+def load_latest_otc_nav_history(code: str) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    init_db()
+    code = "".join(ch for ch in str(code or "") if ch.isdigit())[-6:].zfill(6)
+    if not code:
+        return None, {"ok": False, "label": "场外基金净值历史-数据库", "detail": "代码为空"}
+
+    sql = "SELECT payload_json, snapshot_ts FROM otc_nav_history WHERE code = ? ORDER BY snapshot_ts DESC LIMIT 1"
+    url = database_url()
+    if is_sqlite_url(url):
+        with _sqlite_conn(url) as conn:
+            row = conn.execute(sql, (code,)).fetchone()
+    else:
+        from sqlalchemy import text
+
+        engine = _pg_engine(url)
+        with engine.begin() as conn:
+            row = conn.execute(
+                text(sql.replace("?", ":code")),
+                {"code": code},
+            ).fetchone()
+
+    if not row:
+        return None, {"ok": False, "label": "场外基金净值历史-数据库", "detail": f"{code} 暂无入库净值历史"}
+    records = json.loads(row[0])
+    df = pd.DataFrame(records)
+    if df.empty:
+        return None, {"ok": False, "label": "场外基金净值历史-数据库", "detail": f"{code} 入库净值历史为空"}
+    return df, {"ok": True, "label": "场外基金净值历史-数据库", "detail": f"{code} {len(df):,} 行，快照 {row[1]}"}
+
+
 def save_watchlist(codes: list[str], owner: str = "default") -> int:
     init_db()
     clean_codes = []
@@ -384,7 +460,7 @@ def load_watchlist(owner: str = "default") -> list[str]:
 def database_summary() -> dict[str, Any]:
     init_db()
     summary: dict[str, Any] = {"url": masked_database_url(), "backend": "SQLite" if is_sqlite_url() else "PostgreSQL"}
-    for table in ["etf_spot_snapshot", "sector_heat_snapshot", "score_snapshot", "otc_watch_snapshot", "watchlist"]:
+    for table in ["etf_spot_snapshot", "sector_heat_snapshot", "score_snapshot", "otc_watch_snapshot", "otc_nav_history", "watchlist"]:
         latest = _latest_ts(table) if table != "watchlist" else None
         url = database_url()
         if is_sqlite_url(url):
