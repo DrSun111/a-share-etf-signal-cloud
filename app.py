@@ -901,22 +901,24 @@ def build_open_fund_search_options(
             base[col] = ""
     if "日增长率" in base.columns:
         base["日增长率"] = numeric_series(base["日增长率"])
+    else:
+        base["日增长率"] = np.nan
 
     query = (query or "").strip()
     if query:
         mask = (
-            base["基金代码"].str.contains(query, case=False, na=False)
+            base["基金代码"].astype(str).str.contains(query, case=False, na=False)
             | base["基金简称"].astype(str).str.contains(query, case=False, na=False)
             | base["基金类型"].astype(str).str.contains(query, case=False, na=False)
             | base["拼音缩写"].astype(str).str.contains(query, case=False, na=False)
             | base["拼音全称"].astype(str).str.contains(query, case=False, na=False)
         )
         filtered = base[mask].copy()
-        filtered["_rank"] = filtered["基金代码"].str.startswith(query).astype(int) * 3 + filtered["基金简称"].astype(str).str.contains(query, case=False, na=False).astype(int)
-        filtered = filtered.sort_values(["_rank", "日增长率"], ascending=[False, False], na_position="last")
+        filtered["基金代码"] = filtered["基金代码"].astype(str).str.zfill(6)
+        filtered["_rank"] = filtered["基金代码"].astype(str).str.startswith(str(query)).astype(int) * 3 + filtered["基金简称"].astype(str).str.contains(query, case=False, na=False).astype(int)
+        filtered = filtered.sort_values(["_rank", "日增长率", "基金代码"], ascending=[False, False, True], na_position="last")
     else:
-        sort_col = "日增长率" if "日增长率" in base.columns else "基金代码"
-        filtered = base.sort_values(sort_col, ascending=False, na_position="last")
+        filtered = base.sort_values(["日增长率", "基金代码"], ascending=[False, True], na_position="last")
 
     current = base[base["基金代码"] == current_code]
     if not current.empty and current_code not in set(filtered["基金代码"].head(limit).tolist()):
