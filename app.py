@@ -19,7 +19,6 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from collector import collect_market_snapshot
-from otc_collector import collect_otc_watch_snapshot
 from db_store import (
     database_summary,
     load_latest_etf_spot,
@@ -50,6 +49,12 @@ WEIGHTS = {
 APP_DIR = Path(__file__).resolve().parent
 WATCHLIST_FILE = APP_DIR / "watchlist.json"
 OTC_WATCHLIST_FILE = APP_DIR / "otc_watchlist.json"
+
+
+def collect_otc_watch_snapshot(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    from otc_collector import collect_otc_watch_snapshot as _collect_otc_watch_snapshot
+
+    return _collect_otc_watch_snapshot(*args, **kwargs)
 DEFAULT_WATCHLIST = ["510300", "159915", "512000", "588000", "512880", "159949"]
 DEFAULT_OTC_WATCHLIST = ["110022", "161725", "005827", "001071", "000001"]
 
