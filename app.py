@@ -1360,14 +1360,28 @@ def score_open_fund_model(
     market_env: dict[str, Any],
 ) -> dict[str, Any]:
     price_df = otc_nav_to_price_df(nav_df)
-    through_nav = to_num(row.get("实时穿透净值"))
-    if pd.isna(through_nav):
-        through_nav = to_num(row.get("估算净值"))
-    through_pct = to_num(row.get("实时穿透涨幅"))
-    if pd.isna(through_pct):
-        through_pct = to_num(row.get("估算涨幅"))
+    snapshot_row = otc_row if otc_row is not None else pd.Series(dtype="object")
+    estimate_source = estimation_row if estimation_row is not None else pd.Series(dtype="object")
+
+    def first_valid_number(*values: Any) -> float:
+        for value in values:
+            num = to_num(value)
+            if pd.notna(num):
+                return num
+        return np.nan
+
+    through_nav = first_valid_number(
+        snapshot_row.get("实时穿透净值"),
+        snapshot_row.get("估算净值"),
+        estimate_source.get("估算净值"),
+    )
+    through_pct = first_valid_number(
+        snapshot_row.get("实时穿透涨幅"),
+        snapshot_row.get("估算涨幅"),
+        estimate_source.get("估算涨幅"),
+    )
     if pd.notna(through_nav):
-        snapshot_dt = pd.to_datetime(row.get("快照时间"), errors="coerce")
+        snapshot_dt = pd.to_datetime(snapshot_row.get("快照时间") or estimate_source.get("估算日期"), errors="coerce")
         snapshot_dt = snapshot_dt if pd.notna(snapshot_dt) else pd.Timestamp(date.today())
         append_row = pd.DataFrame(
             {
@@ -1418,7 +1432,7 @@ def score_open_fund_model(
     )
 
     estimate_pct = to_num(estimation_row.get("估算涨幅")) if estimation_row is not None else np.nan
-    daily_pct = estimate_pct if pd.notna(estimate_pct) else (to_num(otc_row.get("日增长率")) if otc_row is not None else to_num(last.get("pct")))
+    daily_pct = first_valid_number(through_pct, estimate_pct, snapshot_row.get("日增长率"), last.get("pct"))
     ret5 = to_num(last.get("return5"))
     ret10 = to_num(last.get("return10"))
     ret20 = to_num(last.get("return20"))
