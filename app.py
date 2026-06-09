@@ -2305,6 +2305,8 @@ with st.sidebar:
     st.session_state["db_read_mode"] = db_read_mode
     otc_snapshot_mode = st.toggle("场外自选优先读后台快照", value=st.session_state.get("otc_snapshot_mode", True))
     st.session_state["otc_snapshot_mode"] = otc_snapshot_mode
+    auto_collect_missing_otc = st.toggle("表格缺失时自动采集", value=st.session_state.get("auto_collect_missing_otc", True))
+    st.session_state["auto_collect_missing_otc"] = auto_collect_missing_otc
     use_db_watchlist = st.toggle("自选池保存到数据库", value=st.session_state.get("use_db_watchlist", False))
     st.session_state["use_db_watchlist"] = use_db_watchlist
     if st.button("同步实时行情入库", use_container_width=True):
@@ -2516,6 +2518,28 @@ start_dt = end_dt - timedelta(days=int(lookback * 1.7))
 start_str = start_dt.strftime("%Y%m%d")
 end_str = end_dt.strftime("%Y%m%d")
 otc_snapshot_focus_row = latest_otc_snapshot_row(otc_watch_snapshot_df, otc_code)
+if (
+    fund_mode == "场外基金"
+    and otc_snapshot_mode
+    and fast_refresh_mode
+    and auto_collect_missing_otc
+    and otc_snapshot_focus_row is None
+):
+    collect_key = f"otc_missing_collect_attempted_{otc_code}"
+    if not st.session_state.get(collect_key):
+        st.session_state[collect_key] = True
+        with st.spinner(f"{otc_code} 不在后台表，正在首次采集并写入数据库..."):
+            try:
+                result = collect_otc_watch_snapshot([otc_code])
+                get_otc_watch_snapshot_from_db.clear()
+                otc_watch_snapshot_df, otc_watch_snapshot_status = get_otc_watch_snapshot_from_db()
+                otc_snapshot_focus_row = latest_otc_snapshot_row(otc_watch_snapshot_df, otc_code)
+                if otc_snapshot_focus_row is not None:
+                    st.success(f"{otc_code} 已写入场外基金表，后续刷新将直接读表。用时 {result.get('elapsed_seconds', 0):.1f} 秒")
+                else:
+                    st.warning(f"{otc_code} 已尝试采集，但后台表暂未返回该基金。")
+            except Exception as exc:  # noqa: BLE001
+                st.warning(f"{otc_code} 首次采集失败：{type(exc).__name__}: {exc}")
 use_otc_fast_snapshot = fund_mode == "场外基金" and otc_snapshot_mode and otc_snapshot_focus_row is not None
 
 with st.spinner("正在读取实时数据..."):
