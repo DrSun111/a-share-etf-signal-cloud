@@ -134,6 +134,13 @@ def init_db() -> None:
             created_at TEXT NOT NULL
         )
         """,
+        "CREATE INDEX IF NOT EXISTS idx_etf_spot_snapshot_ts ON etf_spot_snapshot (snapshot_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_etf_spot_snapshot_code_ts ON etf_spot_snapshot (code, snapshot_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_sector_heat_snapshot_ts ON sector_heat_snapshot (snapshot_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_score_snapshot_code_ts ON score_snapshot (code, snapshot_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_otc_watch_snapshot_ts ON otc_watch_snapshot (snapshot_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_otc_watch_snapshot_code_ts ON otc_watch_snapshot (code, snapshot_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_watchlist_owner_code ON watchlist (owner, code)",
     ]
     for statement in statements:
         _execute(statement)
