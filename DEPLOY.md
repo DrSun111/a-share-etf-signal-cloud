@@ -51,7 +51,7 @@ OTC_WATCHLIST_CODES=025857,110022,018345
 ETF_WATCHLIST_CODES=510300,159915
 ```
 
-其中 `DATABASE_URL` 建议放到 Secrets；`OTC_WATCHLIST_CODES` 和 `ETF_WATCHLIST_CODES` 可放到 Variables 或 Secrets。GitHub Actions 会在 A 股交易时段每 30 分钟运行一次，也可以在 Actions 页面手动点 `Run workflow`，临时输入一组场外基金代码。
+其中 `DATABASE_URL` 建议放到 Secrets；`OTC_WATCHLIST_CODES` 和 `ETF_WATCHLIST_CODES` 可放到 Variables 或 Secrets。若没有配置自选变量，工作流会回退读取仓库里的 `otc_watchlist.json` 和 `watchlist.json`。GitHub Actions 会在 A 股交易时段每 30 分钟运行一次，也可以在 Actions 页面手动点 `Run workflow`，临时输入一组场外基金代码。
 
 工作流会依次执行：
 
