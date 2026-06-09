@@ -18,9 +18,6 @@ import numpy as np
 import pandas as pd
 import requests
 
-from db_store import load_watchlist as load_db_watchlist
-from db_store import save_otc_watch_snapshot
-
 
 APP_DIR = Path(__file__).resolve().parent
 OTC_WATCHLIST_FILE = APP_DIR / "otc_watchlist.json"
@@ -52,6 +49,8 @@ def load_otc_watchlist() -> list[str]:
         return env_codes
     merged: list[str] = []
     try:
+        from db_store import load_watchlist as load_db_watchlist
+
         db_codes = normalize_code_list(load_db_watchlist(owner="otc"))
         merged.extend(code for code in db_codes if code not in merged)
     except Exception:  # noqa: BLE001
@@ -685,6 +684,8 @@ def collect_otc_watch_snapshot(codes: list[str] | str | None = None) -> dict[str
     out = pd.DataFrame(rows)
     if not out.empty and "场外短线评分" in out.columns:
         out = out.sort_values("场外短线评分", ascending=False, na_position="last").reset_index(drop=True)
+    from db_store import save_otc_watch_snapshot
+
     result = save_otc_watch_snapshot(out)
     result.update(
         {
