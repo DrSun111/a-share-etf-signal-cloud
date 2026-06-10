@@ -107,6 +107,137 @@ def percentile_score(value: float, series: pd.Series | None) -> float:
     return clamp((clean <= value).mean() * 100)
 
 
+def position_signal_scores(
+    total_score: float,
+    trend_score: float,
+    momentum_score: float,
+    holding_score: float,
+    heat_score: float,
+    risk_score: float,
+    ret5: float,
+    ret10: float,
+    ret20: float,
+    realtime_pct: float,
+    contribution: float,
+    up_ratio: float,
+    drawdown120: float,
+    macd: float,
+    dea: float,
+    macd_hist: float,
+    market_score: float = 50.0,
+) -> dict[str, Any]:
+    trend_score = clamp(trend_score)
+    momentum_score = clamp(momentum_score)
+    holding_score = clamp(holding_score)
+    heat_score = clamp(heat_score)
+    risk_score = clamp(risk_score)
+    market_score = clamp(market_score)
+    total_score = clamp(total_score)
+
+    realtime_confirm = (
+        (pd.notna(realtime_pct) and realtime_pct > 0)
+        or (pd.notna(contribution) and contribution > 0.08)
+        or (pd.notna(up_ratio) and up_ratio >= 55)
+    )
+    macd_confirm = pd.notna(macd) and pd.notna(dea) and macd >= dea
+    if pd.notna(macd_hist):
+        macd_confirm = macd_confirm or macd_hist > 0
+    not_overheated = not (
+        (pd.notna(ret5) and ret5 > 8)
+        or (pd.notna(ret10) and ret10 > 12)
+        or (pd.notna(realtime_pct) and realtime_pct > 3.5)
+    )
+    risk_block = risk_score < 45 or (pd.notna(drawdown120) and drawdown120 > 18)
+    trend_block = trend_score < 42 and momentum_score < 48
+
+    build_score = clamp(
+        trend_score * 0.22
+        + momentum_score * 0.20
+        + holding_score * 0.16
+        + heat_score * 0.14
+        + risk_score * 0.18
+        + market_score * 0.10
+        + (5 if realtime_confirm else -4)
+        + (4 if macd_confirm else 0)
+        + (4 if pd.notna(ret20) and ret20 > 0 else 0)
+        - (12 if risk_block else 0)
+        - (8 if not not_overheated else 0)
+    )
+    add_score = clamp(
+        trend_score * 0.26
+        + momentum_score * 0.20
+        + holding_score * 0.20
+        + heat_score * 0.16
+        + risk_score * 0.10
+        + market_score * 0.08
+        + (6 if realtime_confirm else -6)
+        + (5 if macd_confirm else 0)
+        + (4 if pd.notna(ret5) and ret5 > 1.5 else 0)
+        - (14 if risk_block else 0)
+        - (10 if not not_overheated else 0)
+    )
+
+    if risk_block or trend_block or not not_overheated:
+        build_signal = "暂不建仓"
+    elif build_score >= 76 and trend_score >= 60 and risk_score >= 55 and market_score >= 42:
+        build_signal = "建仓确认"
+    elif build_score >= 66 and risk_score >= 50 and (realtime_confirm or macd_confirm):
+        build_signal = "小仓试探"
+    elif build_score >= 58:
+        build_signal = "观察等确认"
+    else:
+        build_signal = "暂不建仓"
+
+    if risk_block or not not_overheated:
+        add_signal = "禁止加仓"
+    elif add_score >= 80 and trend_score >= 68 and momentum_score >= 60 and holding_score >= 55 and market_score >= 42:
+        add_signal = "顺势加仓"
+    elif add_score >= 70 and trend_score >= 58 and realtime_confirm:
+        add_signal = "轻度加仓"
+    elif add_score >= 60:
+        add_signal = "持仓观察"
+    else:
+        add_signal = "不加仓"
+
+    if add_signal in {"顺势加仓", "轻度加仓"}:
+        position_action = add_signal
+    elif build_signal in {"建仓确认", "小仓试探"}:
+        position_action = build_signal
+    elif risk_block:
+        position_action = "风险回避"
+    elif not not_overheated:
+        position_action = "防追高"
+    else:
+        position_action = "等待"
+
+    reasons = []
+    if trend_score >= 60:
+        reasons.append("趋势成立")
+    if realtime_confirm:
+        reasons.append("穿透确认")
+    if macd_confirm:
+        reasons.append("MACD确认")
+    if heat_score >= 60:
+        reasons.append("同类/板块前排")
+    if risk_score >= 55 and not_overheated:
+        reasons.append("风险可控")
+    if risk_block:
+        reasons.append("回撤/风险偏高")
+    if not not_overheated:
+        reasons.append("短线过热")
+    if not reasons:
+        reasons.append("信号不足")
+
+    return {
+        "建仓评分": build_score,
+        "建仓信号": build_signal,
+        "加仓评分": add_score,
+        "加仓信号": add_signal,
+        "仓位动作": position_action,
+        "信号依据": "、".join(reasons[:4]),
+    }
+
+
 def run_vendor(label: str, fn, *args, **kwargs) -> tuple[pd.DataFrame | None, dict[str, Any]]:
     try:
         df = fn(*args, **kwargs)
@@ -566,6 +697,25 @@ def score_watch_item(
     else:
         action = "观察等待"
 
+    position_signal = position_signal_scores(
+        total_score=total,
+        trend_score=trend_score,
+        momentum_score=momentum_score,
+        holding_score=holding_score,
+        heat_score=heat_score,
+        risk_score=risk_score,
+        ret5=ret5,
+        ret10=ret10,
+        ret20=ret20,
+        realtime_pct=realtime_pct,
+        contribution=contribution,
+        up_ratio=up_ratio,
+        drawdown120=drawdown120,
+        macd=macd,
+        dea=dea,
+        macd_hist=macd_hist,
+    )
+
     name = ""
     if daily_row is not None:
         name = str(daily_row.get("基金简称") or "")
@@ -622,6 +772,7 @@ def score_watch_item(
         "风险控制分": risk_score,
         "场外短线评分": clamp(total),
         "动作": action,
+        **position_signal,
         "申购状态": str(daily_row.get("申购状态") or "-") if daily_row is not None else "-",
         "赎回状态": str(daily_row.get("赎回状态") or "-") if daily_row is not None else "-",
         "手续费": str(daily_row.get("手续费") or "-") if daily_row is not None else "-",
