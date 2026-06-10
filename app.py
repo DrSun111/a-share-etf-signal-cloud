@@ -348,6 +348,20 @@ def percentile_score(value: float, series: pd.Series, higher_is_better: bool = T
     return clamp(rank if higher_is_better else 100 - rank)
 
 
+def valid_realtime_pct(value: float, limit: float = 12.0) -> float:
+    value = to_num(value)
+    if pd.isna(value) or abs(value) > limit:
+        return np.nan
+    return value
+
+
+def safe_weighted_contribution(weight: pd.Series, pct: pd.Series) -> pd.Series:
+    weight_num = numeric_series(weight).clip(lower=0, upper=100)
+    pct_num = numeric_series(pct)
+    pct_num = pct_num.where(pct_num.abs() <= 20)
+    return weight_num * pct_num / 100
+
+
 def otc_position_signal_from_values(
     total_score: float,
     trend_score: float,
@@ -366,6 +380,7 @@ def otc_position_signal_from_values(
     dif: float = np.nan,
     dea: float = np.nan,
     macd_hist: float = np.nan,
+    fund_flow_score: float = np.nan,
 ) -> dict[str, Any]:
     trend_score = clamp(trend_score)
     momentum_score = clamp(momentum_score)
@@ -374,11 +389,13 @@ def otc_position_signal_from_values(
     risk_score = clamp(risk_score)
     market_score = clamp(market_score)
     total_score = clamp(total_score)
+    flow_confirm = pd.notna(fund_flow_score) and fund_flow_score >= 58
 
     realtime_confirm = (
         (pd.notna(through_pct) and through_pct > 0)
         or (pd.notna(contribution) and contribution > 0.08)
         or (pd.notna(up_ratio) and up_ratio >= 55)
+        or flow_confirm
     )
     macd_confirm = pd.notna(dif) and pd.notna(dea) and dif >= dea
     if pd.notna(macd_hist):
@@ -399,6 +416,7 @@ def otc_position_signal_from_values(
         + risk_score * 0.18
         + market_score * 0.10
         + (5 if realtime_confirm else -4)
+        + (4 if flow_confirm else 0)
         + (4 if macd_confirm else 0)
         + (4 if pd.notna(ret20) and ret20 > 0 else 0)
         - (12 if risk_block else 0)
@@ -412,6 +430,7 @@ def otc_position_signal_from_values(
         + risk_score * 0.10
         + market_score * 0.08
         + (6 if realtime_confirm else -6)
+        + (5 if flow_confirm else 0)
         + (5 if macd_confirm else 0)
         + (4 if pd.notna(ret5) and ret5 > 1.5 else 0)
         - (14 if risk_block else 0)
@@ -460,6 +479,8 @@ def otc_position_signal_from_values(
         reasons.append("MACD确认")
     if heat_score >= 60:
         reasons.append("同类/板块前排")
+    if flow_confirm:
+        reasons.append("资金确认")
     if risk_score >= 55 and not_overheated:
         reasons.append("风险可控")
     if risk_block:
@@ -498,6 +519,7 @@ def otc_position_signal_from_row(row: pd.Series | dict[str, Any], market_score: 
         dif=to_num(row.get("DIF")),
         dea=to_num(row.get("DEA")),
         macd_hist=to_num(row.get("MACD柱")),
+        fund_flow_score=to_num(row.get("资金确认分")),
     )
 
 
@@ -515,6 +537,43 @@ def ensure_otc_position_columns(df: pd.DataFrame, market_score: float = 50.0) ->
             out[col] = signal_df[col]
         else:
             out[col] = out[col].where(out[col].notna() & (out[col].astype(str).str.strip() != ""), signal_df[col])
+    return out
+
+
+def sanitize_otc_realtime_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "实时穿透涨幅" in out.columns:
+        rt = numeric_series(out["实时穿透涨幅"])
+        rt = rt.where(rt.abs() <= 12)
+        if "估算涨幅" in out.columns:
+            est = numeric_series(out["估算涨幅"]).where(lambda s: s.abs() <= 12)
+            rt = rt.combine_first(est)
+            if "穿透来源" not in out.columns:
+                out["穿透来源"] = np.where(rt.notna() & numeric_series(out["实时穿透涨幅"]).abs().gt(12), "估算涨幅异常回退", "")
+        out["实时穿透涨幅"] = rt
+    if "重仓估算贡献" in out.columns:
+        contrib = numeric_series(out["重仓估算贡献"])
+        out["重仓估算贡献"] = contrib.where(contrib.abs() <= 12)
+    if "实时穿透净值" in out.columns:
+        nav = numeric_series(out["实时穿透净值"])
+        if "估算净值" in out.columns:
+            est_nav = numeric_series(out["估算净值"])
+            nav = nav.where(nav.notna() & (nav > 0)).combine_first(est_nav)
+        if "最新单位净值" in out.columns and "实时穿透涨幅" in out.columns:
+            unit_nav = numeric_series(out["最新单位净值"])
+            pct = numeric_series(out["实时穿透涨幅"])
+            computed_nav = unit_nav * (1 + pct / 100)
+            nav = nav.where(
+                nav.notna()
+                & (nav > 0)
+                & unit_nav.notna()
+                & unit_nav.gt(0)
+                & ((nav / unit_nav - 1).abs() <= 0.12),
+                computed_nav,
+            )
+        out["实时穿透净值"] = nav
     return out
 
 
@@ -1682,16 +1741,24 @@ def score_open_fund_model(
                 return num
         return np.nan
 
-    through_nav = first_valid_number(
-        snapshot_row.get("实时穿透净值"),
-        snapshot_row.get("估算净值"),
-        estimate_source.get("估算净值"),
-    )
-    through_pct = first_valid_number(
-        snapshot_row.get("实时穿透涨幅"),
-        snapshot_row.get("估算涨幅"),
-        estimate_source.get("估算涨幅"),
-    )
+    estimate_pct = valid_realtime_pct(first_valid_number(snapshot_row.get("估算涨幅"), estimate_source.get("估算涨幅")))
+    through_pct = valid_realtime_pct(snapshot_row.get("实时穿透涨幅"))
+    if pd.isna(through_pct):
+        through_pct = estimate_pct
+        through_source = "东财盘中估值"
+    else:
+        through_source = str(snapshot_row.get("穿透来源") or "实时穿透")
+    estimated_nav_value = first_valid_number(snapshot_row.get("估算净值"), estimate_source.get("估算净值"))
+    latest_unit_nav_value = first_valid_number(snapshot_row.get("最新单位净值"), snapshot_row.get("单位净值"))
+    raw_through_nav = to_num(snapshot_row.get("实时穿透净值"))
+    if pd.notna(estimated_nav_value):
+        through_nav = estimated_nav_value
+    elif pd.notna(raw_through_nav) and pd.notna(latest_unit_nav_value) and latest_unit_nav_value > 0 and abs(raw_through_nav / latest_unit_nav_value - 1) <= 0.12:
+        through_nav = raw_through_nav
+    elif pd.notna(latest_unit_nav_value) and pd.notna(through_pct):
+        through_nav = latest_unit_nav_value * (1 + through_pct / 100)
+    else:
+        through_nav = np.nan
     if pd.notna(through_nav):
         snapshot_dt = pd.to_datetime(snapshot_row.get("快照时间") or estimate_source.get("估算日期"), errors="coerce")
         snapshot_dt = snapshot_dt if pd.notna(snapshot_dt) else pd.Timestamp(date.today())
@@ -1743,7 +1810,6 @@ def score_open_fund_model(
         + linear_score(rel_strength, -7, 8) * 0.06
     )
 
-    estimate_pct = to_num(estimation_row.get("估算涨幅")) if estimation_row is not None else np.nan
     daily_pct = first_valid_number(through_pct, estimate_pct, snapshot_row.get("日增长率"), last.get("pct"))
     ret5 = to_num(last.get("return5"))
     ret10 = to_num(last.get("return10"))
@@ -1769,11 +1835,16 @@ def score_open_fund_model(
     contribution = np.nan
     up_ratio = np.nan
     flow_score = 50.0
+    main_flow = np.nan
+    weighted_main_flow = np.nan
+    positive_flow_weight = np.nan
+    quote_coverage = np.nan
     if holding_impact is not None and not holding_impact.empty:
         if "占净值比例" in holding_impact.columns:
             top_weight = numeric_series(holding_impact["占净值比例"]).dropna().sum()
         if "估算贡献" in holding_impact.columns:
             contribution = numeric_series(holding_impact["估算贡献"]).dropna().sum()
+            contribution = valid_realtime_pct(contribution)
         if "涨跌幅" in holding_impact.columns:
             pct = numeric_series(holding_impact["涨跌幅"]).dropna()
             if not pct.empty:
@@ -1781,7 +1852,34 @@ def score_open_fund_model(
         if "主力净流入-净额" in holding_impact.columns:
             flow = numeric_series(holding_impact["主力净流入-净额"]).dropna()
             if not flow.empty:
-                flow_score = linear_score(flow.sum(), -8e8, 8e8)
+                main_flow = flow.sum()
+                flow_score = linear_score(main_flow, -8e8, 8e8)
+                if "占净值比例" in holding_impact.columns:
+                    flow_df = pd.DataFrame(
+                        {
+                            "weight": numeric_series(holding_impact["占净值比例"]),
+                            "flow": numeric_series(holding_impact["主力净流入-净额"]),
+                        }
+                    ).dropna()
+                    if not flow_df.empty:
+                        flow_df["weight"] = flow_df["weight"].clip(lower=0, upper=100)
+                        weighted_main_flow = (flow_df["flow"] * flow_df["weight"] / 100).sum()
+                        denom = flow_df["weight"].sum()
+                        if denom > 0:
+                            positive_flow_weight = flow_df.loc[flow_df["flow"] > 0, "weight"].sum() / denom * 100
+                        flow_score = clamp(
+                            linear_score(weighted_main_flow, -1.5e8, 1.5e8) * 0.45
+                            + linear_score(positive_flow_weight, 30, 70) * 0.35
+                            + linear_score(main_flow, -8e8, 8e8) * 0.20
+                        )
+        if "涨跌幅" in holding_impact.columns:
+            quote_coverage = numeric_series(holding_impact["涨跌幅"]).notna().mean() * 100
+        if pd.isna(main_flow) and pd.notna(contribution):
+            flow_score = clamp(
+                linear_score(contribution, -0.7, 0.9) * 0.45
+                + linear_score(up_ratio, 35, 70) * 0.35
+                + linear_score(quote_coverage, 45, 90) * 0.20
+            )
     holding_score = clamp(
         linear_score(contribution, -1.1, 1.2) * 0.38
         + linear_score(up_ratio, 32, 70) * 0.22
@@ -1885,6 +1983,7 @@ def score_open_fund_model(
         dif=to_num(last.get("macd")),
         dea=to_num(last.get("macd_signal")),
         macd_hist=to_num(last.get("macd_hist")),
+        fund_flow_score=flow_score,
     )
 
     positives: list[str] = []
@@ -1930,6 +2029,9 @@ def score_open_fund_model(
             "estimate_pct": estimate_pct,
             "estimated_nav": to_num(estimation_row.get("估算净值")) if estimation_row is not None else np.nan,
             "estimate_bias": to_num(estimation_row.get("估算偏差")) if estimation_row is not None else np.nan,
+            "through_nav": through_nav,
+            "through_pct": through_pct,
+            "through_source": through_source,
             "ret5": ret5,
             "ret10": ret10,
             "ret20": ret20,
@@ -1942,6 +2044,11 @@ def score_open_fund_model(
             "top_weight": top_weight,
             "holding_contribution": contribution,
             "holding_up_ratio": up_ratio,
+            "main_flow": main_flow,
+            "weighted_main_flow": weighted_main_flow,
+            "positive_flow_weight": positive_flow_weight,
+            "quote_coverage": quote_coverage,
+            "fund_flow_score": flow_score,
             "space_to_high": space_to_high,
             "drawdown120": drawdown120,
             "volatility20": volatility20,
@@ -2142,7 +2249,7 @@ def format_open_fund_display(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["日增长值", "日增长率"]:
         if col in out:
             out[col] = out[col].map(lambda x: pct_text(to_num(x)) if col == "日增长率" else (f"{to_num(x):.4f}" if pd.notna(to_num(x)) else "-"))
-    for col in ["估算涨幅", "估算偏差", "公布日增长率", "实时穿透涨幅", "重仓估算贡献", "前20持仓权重", "上涨重仓股比例", "近5日", "近10日", "近20日", "120日回撤"]:
+    for col in ["估算涨幅", "估算偏差", "公布日增长率", "实时穿透涨幅", "重仓估算贡献", "前20持仓权重", "上涨重仓股比例", "主力流入权重占比", "近5日", "近10日", "近20日", "120日回撤"]:
         if col in out:
             out[col] = out[col].map(lambda x: pct_text(to_num(x)))
     for col in ["估算净值", "实时穿透净值", "公布单位净值", "上一净值"]:
@@ -2150,16 +2257,19 @@ def format_open_fund_display(df: pd.DataFrame) -> pd.DataFrame:
             out[col] = out[col].map(lambda x: f"{to_num(x):.4f}" if pd.notna(to_num(x)) else "-")
     if "场外机会分" in out:
         out["场外机会分"] = out["场外机会分"].map(lambda x: f"{to_num(x):.1f}" if pd.notna(to_num(x)) else "-")
-    for col in ["场外短线评分", "趋势分", "净值动能分", "持仓穿透分", "同类热度分", "风险控制分", "建仓评分", "加仓评分"]:
+    for col in ["场外短线评分", "趋势分", "净值动能分", "持仓穿透分", "同类热度分", "风险控制分", "建仓评分", "加仓评分", "资金确认分", "行情覆盖率"]:
         if col in out:
             out[col] = out[col].map(lambda x: f"{to_num(x):.1f}" if pd.notna(to_num(x)) else "-")
+    for col in ["重仓主力净额", "加权主力净额"]:
+        if col in out:
+            out[col] = out[col].map(format_money)
     for col in ["DIF", "DEA", "MACD柱"]:
         if col in out:
             out[col] = out[col].map(lambda x: f"{to_num(x):.4f}" if pd.notna(to_num(x)) else "-")
     if "上涨重仓股数" in out:
         out["上涨重仓股数"] = out["上涨重仓股数"].map(lambda x: f"{to_num(x):.0f}" if pd.notna(to_num(x)) else "-")
     cols = ["基金代码", "基金简称", "基金类型", "场外短线评分", "动作", "建仓评分", "建仓信号", "加仓评分", "加仓信号", "仓位动作", "信号依据"]
-    cols += ["估算涨幅", "实时穿透涨幅", "重仓估算贡献", "近5日", "近20日", "120日回撤"]
+    cols += ["估算涨幅", "实时穿透涨幅", "穿透来源", "重仓估算贡献", "资金确认分", "重仓主力净额", "加权主力净额", "主力流入权重占比", "行情覆盖率", "近5日", "近20日", "120日回撤"]
     cols += ["实时穿透净值", "估算净值", "估算偏差", "最新单位净值", "日增长率", "前20持仓权重", "上涨重仓股数", "上涨重仓股比例", "DIF", "DEA", "MACD柱"]
     cols += ["场外机会分", "盯盘提示", "申购状态", "赎回状态", "手续费", "快照时间"]
     cols += [col for col in out.columns if ("单位净值" in col or "累计净值" in col or col in {"公布日增长率", "公布单位净值", "上一净值", "估算日期", "数据来源"}) and col not in cols]
@@ -2223,6 +2333,7 @@ def filter_otc_snapshot_table(snapshot_df: pd.DataFrame | None, codes: list[str]
     if "场外短线评分" in df.columns:
         df["场外短线评分"] = numeric_series(df["场外短线评分"])
         df = df.sort_values("场外短线评分", ascending=False, na_position="last")
+    df = sanitize_otc_realtime_columns(df)
     df = ensure_otc_position_columns(df, market_score=market_score)
     return df.reset_index(drop=True)
 
@@ -2254,12 +2365,24 @@ def open_fund_model_from_snapshot(row: pd.Series | None, nav_df: pd.DataFrame | 
         }
 
     price_df = otc_nav_to_price_df(nav_df)
-    through_nav = to_num(row.get("实时穿透净值"))
-    if pd.isna(through_nav):
-        through_nav = to_num(row.get("估算净值"))
-    through_pct = to_num(row.get("实时穿透涨幅"))
+    estimate_pct = valid_realtime_pct(row.get("估算涨幅"))
+    through_pct = valid_realtime_pct(row.get("实时穿透涨幅"))
     if pd.isna(through_pct):
-        through_pct = to_num(row.get("估算涨幅"))
+        through_pct = estimate_pct
+        through_source = "东财盘中估值/异常回退" if pd.notna(estimate_pct) else str(row.get("穿透来源") or "-")
+    else:
+        through_source = str(row.get("穿透来源") or "实时穿透")
+    estimated_nav_value = to_num(row.get("估算净值"))
+    latest_unit_nav_value = to_num(row.get("最新单位净值"))
+    raw_through_nav = to_num(row.get("实时穿透净值"))
+    if pd.notna(estimated_nav_value):
+        through_nav = estimated_nav_value
+    elif pd.notna(raw_through_nav) and pd.notna(latest_unit_nav_value) and latest_unit_nav_value > 0 and abs(raw_through_nav / latest_unit_nav_value - 1) <= 0.12:
+        through_nav = raw_through_nav
+    elif pd.notna(latest_unit_nav_value) and pd.notna(through_pct):
+        through_nav = latest_unit_nav_value * (1 + through_pct / 100)
+    else:
+        through_nav = np.nan
     if pd.notna(through_nav):
         snapshot_dt = pd.to_datetime(row.get("快照时间"), errors="coerce")
         snapshot_dt = snapshot_dt if pd.notna(snapshot_dt) else pd.Timestamp(date.today())
@@ -2303,17 +2426,22 @@ def open_fund_model_from_snapshot(row: pd.Series | None, nav_df: pd.DataFrame | 
     negatives: list[str] = []
     snapshot_time = str(row.get("快照时间") or "")
     source = str(row.get("数据来源") or "后台快照")
+    signal_row = row.copy()
+    signal_row["实时穿透涨幅"] = through_pct
+    signal_row["实时穿透净值"] = through_nav
+    clean_contribution = valid_realtime_pct(row.get("重仓估算贡献"))
+    signal_row["重仓估算贡献"] = clean_contribution
     positives.append(f"已读取后台快照：{snapshot_time or '最新一批'}")
     positives.append(f"快照来源：{source}")
     if to_num(row.get("近5日")) > 0:
         positives.append(f"近5日净值表现 {to_num(row.get('近5日')):.2f}%")
-    if to_num(row.get("重仓估算贡献")) > 0:
-        positives.append(f"重仓股实时穿透贡献约 {to_num(row.get('重仓估算贡献')):.2f}%")
+    if pd.notna(clean_contribution) and clean_contribution > 0:
+        positives.append(f"重仓股实时穿透贡献约 {clean_contribution:.2f}%")
     if action in {"减仓", "离场", "禁止追高"}:
         negatives.append(f"后台快照动作提示为：{action}")
     if to_num(row.get("120日回撤")) > 12:
         negatives.append(f"120日回撤约 {to_num(row.get('120日回撤')):.2f}%，位置风险偏高")
-    position_signal = otc_position_signal_from_row(row, market_score=market_env.get("score", 50))
+    position_signal = otc_position_signal_from_row(signal_row, market_score=market_env.get("score", 50))
     if position_signal["仓位动作"] in {"建仓确认", "小仓试探", "轻度加仓", "顺势加仓"}:
         positives.append(f"仓位信号：{position_signal['仓位动作']}，依据：{position_signal['信号依据']}")
     elif position_signal["仓位动作"] in {"风险回避", "防追高"}:
@@ -2344,8 +2472,14 @@ def open_fund_model_from_snapshot(row: pd.Series | None, nav_df: pd.DataFrame | 
             "achievement_rank": np.nan,
             "stock_position": np.nan,
             "top_weight": to_num(row.get("前20持仓权重")),
-            "holding_contribution": to_num(row.get("重仓估算贡献")),
+            "holding_contribution": clean_contribution,
             "holding_up_ratio": to_num(row.get("上涨重仓股比例")),
+            "main_flow": to_num(row.get("重仓主力净额")),
+            "weighted_main_flow": to_num(row.get("加权主力净额")),
+            "positive_flow_weight": to_num(row.get("主力流入权重占比")),
+            "quote_coverage": to_num(row.get("行情覆盖率")),
+            "fund_flow_score": to_num(row.get("资金确认分")),
+            "through_source": through_source,
             "space_to_high": np.nan,
             "drawdown120": to_num(row.get("120日回撤")),
             "volatility20": np.nan,
@@ -2375,7 +2509,7 @@ def build_holding_impact_table(holdings_df: pd.DataFrame | None, a_spot: pd.Data
                 spot[col] = numeric_series(spot[col])
         top = top.merge(spot[keep_cols], on="股票代码", how="left")
         if "占净值比例" in top.columns and "涨跌幅" in top.columns:
-            top["估算贡献"] = top["占净值比例"] * top["涨跌幅"] / 100
+            top["估算贡献"] = safe_weighted_contribution(top["占净值比例"], top["涨跌幅"])
             total = top["估算贡献"].dropna().sum()
         else:
             total = np.nan
@@ -3003,6 +3137,7 @@ if otc_snapshot_mode and otc_watch_snapshot_df is not None and not otc_watch_sna
     otc_watchlist_table = filter_otc_snapshot_table(otc_watch_snapshot_df, otc_watchlist_codes, market_score=market_env.get("score", 50))
 else:
     otc_watchlist_table = build_open_fund_watch_table(open_fund_daily, fund_names, otc_watchlist_codes, open_fund_estimation)
+    otc_watchlist_table = sanitize_otc_realtime_columns(otc_watchlist_table)
     otc_watchlist_table = ensure_otc_position_columns(otc_watchlist_table, market_score=market_env.get("score", 50))
 otc_row = latest_open_fund_row(open_fund_daily, otc_code)
 if otc_row is None:
@@ -3114,6 +3249,11 @@ if fund_mode == "场外基金":
         position_cols[1].metric("建仓信号", str(otc_raw.get("建仓信号") or "-"))
         position_cols[2].metric("加仓评分", f"{to_num(otc_raw.get('加仓评分')):.1f}" if pd.notna(to_num(otc_raw.get("加仓评分"))) else "-")
         position_cols[3].metric("加仓信号", str(otc_raw.get("加仓信号") or "-"))
+        fund_flow_cols = st.columns(4)
+        fund_flow_cols[0].metric("资金确认分", f"{to_num(otc_raw.get('fund_flow_score')):.1f}" if pd.notna(to_num(otc_raw.get("fund_flow_score"))) else "-")
+        fund_flow_cols[1].metric("重仓主力净额", format_money(to_num(otc_raw.get("main_flow"))))
+        fund_flow_cols[2].metric("主力流入权重", pct_text(to_num(otc_raw.get("positive_flow_weight"))))
+        fund_flow_cols[3].metric("穿透来源", str(otc_raw.get("through_source") or "-"))
 
         st.subheader("场外自选基金短线操作评分排行")
         if otc_watchlist_table.empty:
@@ -3131,7 +3271,7 @@ if fund_mode == "场外基金":
                         y=name_col,
                         color="动作" if "动作" in chart_df.columns else None,
                         orientation="h",
-                        hover_data=[col for col in ["基金代码", "建仓评分", "建仓信号", "加仓评分", "加仓信号", "仓位动作", "估算涨幅", "实时穿透涨幅", "重仓估算贡献", "近5日", "120日回撤", "快照时间"] if col in chart_df.columns],
+                        hover_data=[col for col in ["基金代码", "建仓评分", "建仓信号", "加仓评分", "加仓信号", "仓位动作", "资金确认分", "重仓主力净额", "主力流入权重占比", "估算涨幅", "实时穿透涨幅", "穿透来源", "重仓估算贡献", "近5日", "120日回撤", "快照时间"] if col in chart_df.columns],
                     )
                     fig.update_layout(height=max(260, min(520, 42 * len(chart_df) + 120)), margin=dict(l=10, r=10, t=10, b=10))
                     st.plotly_chart(fig, use_container_width=True)
@@ -3217,6 +3357,12 @@ if fund_mode == "场外基金":
             impact_cols[4].metric("上涨重仓股数", f"{int((otc_holding_impact['涨跌幅'] > 0).sum())}")
         else:
             impact_cols[4].metric("上涨重仓比例", pct_text(to_num(otc_raw.get("holding_up_ratio"))))
+        flow_cols = st.columns(5)
+        flow_cols[0].metric("资金确认分", f"{to_num(otc_raw.get('fund_flow_score')):.1f}" if pd.notna(to_num(otc_raw.get("fund_flow_score"))) else "-")
+        flow_cols[1].metric("重仓主力净额", format_money(to_num(otc_raw.get("main_flow"))))
+        flow_cols[2].metric("加权主力净额", format_money(to_num(otc_raw.get("weighted_main_flow"))))
+        flow_cols[3].metric("流入权重占比", pct_text(to_num(otc_raw.get("positive_flow_weight"))))
+        flow_cols[4].metric("行情覆盖率", pct_text(to_num(otc_raw.get("quote_coverage"))))
         if otc_holding_impact is not None and not otc_holding_impact.empty and "主力净流入-净额" in otc_holding_impact:
             st.metric("重仓主力净额", format_money(numeric_series(otc_holding_impact["主力净流入-净额"]).sum()))
         if otc_holding_impact is not None and not otc_holding_impact.empty:
