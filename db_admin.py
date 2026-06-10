@@ -114,14 +114,28 @@ def command_summary(_: argparse.Namespace) -> dict[str, Any]:
 
 def command_init(_: argparse.Namespace) -> dict[str, Any]:
     db_store.init_db()
-    return {"ok": True, "database": db_store.masked_database_url(), "summary": db_store.database_summary()}
+    return {"ok": True, "database": db_store.masked_database_url()}
 
 
 def command_seed_watchlist(args: argparse.Namespace) -> dict[str, Any]:
-    etf_codes = normalize_code_list(args.etf or os.environ.get("ETF_WATCHLIST_CODES"))
-    otc_codes = normalize_code_list(args.otc or os.environ.get("OTC_WATCHLIST_CODES"))
-    etf_source = "args/env" if etf_codes else "watchlist.json"
-    otc_source = "args/env" if otc_codes else "otc_watchlist.json"
+    explicit_etf_codes = normalize_code_list(args.etf or os.environ.get("ETF_WATCHLIST_CODES"))
+    explicit_otc_codes = normalize_code_list(args.otc or os.environ.get("OTC_WATCHLIST_CODES"))
+    existing_etf_codes: list[str] = []
+    existing_otc_codes: list[str] = []
+    if not explicit_etf_codes or not explicit_otc_codes:
+        try:
+            if not explicit_etf_codes:
+                existing_etf_codes = normalize_code_list(db_store.load_watchlist(owner="default"))
+            if not explicit_otc_codes:
+                existing_otc_codes = normalize_code_list(db_store.load_watchlist(owner="otc"))
+        except Exception:  # noqa: BLE001 - fall back to repository JSON during first deploy.
+            existing_etf_codes = []
+            existing_otc_codes = []
+
+    etf_codes = explicit_etf_codes or existing_etf_codes
+    otc_codes = explicit_otc_codes or existing_otc_codes
+    etf_source = "args/env" if explicit_etf_codes else ("database_existing" if existing_etf_codes else "watchlist.json")
+    otc_source = "args/env" if explicit_otc_codes else ("database_existing" if existing_otc_codes else "otc_watchlist.json")
     if not etf_codes:
         etf_codes = load_codes_from_json_file("watchlist.json")
     if not otc_codes:
@@ -134,10 +148,14 @@ def command_seed_watchlist(args: argparse.Namespace) -> dict[str, Any]:
         "etf_source": etf_source if etf_codes else "none",
         "otc_source": otc_source if otc_codes else "none",
     }
-    if etf_codes:
+    if etf_codes and etf_source != "database_existing":
         result["etf_saved"] = db_store.save_watchlist(etf_codes, owner="default")
-    if otc_codes:
+    elif etf_codes:
+        result["etf_saved"] = "kept_existing"
+    if otc_codes and otc_source != "database_existing":
         result["otc_saved"] = db_store.save_watchlist(otc_codes, owner="otc")
+    elif otc_codes:
+        result["otc_saved"] = "kept_existing"
     if not etf_codes and not otc_codes:
         result["detail"] = "No ETF_WATCHLIST_CODES or OTC_WATCHLIST_CODES provided."
     return result
