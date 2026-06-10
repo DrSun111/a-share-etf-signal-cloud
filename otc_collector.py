@@ -107,6 +107,20 @@ def percentile_score(value: float, series: pd.Series | None) -> float:
     return clamp((clean <= value).mean() * 100)
 
 
+def valid_realtime_pct(value: float, limit: float = 12.0) -> float:
+    value = to_num(value)
+    if pd.isna(value) or abs(value) > limit:
+        return np.nan
+    return value
+
+
+def safe_weighted_contribution(weight: pd.Series, pct: pd.Series) -> pd.Series:
+    weight_num = numeric_series(weight).clip(lower=0, upper=100)
+    pct_num = numeric_series(pct)
+    pct_num = pct_num.where(pct_num.abs() <= 20)
+    return weight_num * pct_num / 100
+
+
 def position_signal_scores(
     total_score: float,
     trend_score: float,
@@ -125,6 +139,7 @@ def position_signal_scores(
     dea: float,
     macd_hist: float,
     market_score: float = 50.0,
+    fund_flow_score: float = np.nan,
 ) -> dict[str, Any]:
     trend_score = clamp(trend_score)
     momentum_score = clamp(momentum_score)
@@ -133,11 +148,13 @@ def position_signal_scores(
     risk_score = clamp(risk_score)
     market_score = clamp(market_score)
     total_score = clamp(total_score)
+    flow_confirm = pd.notna(fund_flow_score) and fund_flow_score >= 58
 
     realtime_confirm = (
         (pd.notna(realtime_pct) and realtime_pct > 0)
         or (pd.notna(contribution) and contribution > 0.08)
         or (pd.notna(up_ratio) and up_ratio >= 55)
+        or flow_confirm
     )
     macd_confirm = pd.notna(macd) and pd.notna(dea) and macd >= dea
     if pd.notna(macd_hist):
@@ -158,6 +175,7 @@ def position_signal_scores(
         + risk_score * 0.18
         + market_score * 0.10
         + (5 if realtime_confirm else -4)
+        + (4 if flow_confirm else 0)
         + (4 if macd_confirm else 0)
         + (4 if pd.notna(ret20) and ret20 > 0 else 0)
         - (12 if risk_block else 0)
@@ -171,6 +189,7 @@ def position_signal_scores(
         + risk_score * 0.10
         + market_score * 0.08
         + (6 if realtime_confirm else -6)
+        + (5 if flow_confirm else 0)
         + (5 if macd_confirm else 0)
         + (4 if pd.notna(ret5) and ret5 > 1.5 else 0)
         - (14 if risk_block else 0)
@@ -219,6 +238,8 @@ def position_signal_scores(
         reasons.append("MACD确认")
     if heat_score >= 60:
         reasons.append("同类/板块前排")
+    if flow_confirm:
+        reasons.append("资金确认")
     if risk_score >= 55 and not_overheated:
         reasons.append("风险可控")
     if risk_block:
@@ -564,7 +585,17 @@ def get_holdings(code: str) -> pd.DataFrame:
 
 
 def holding_impact(holdings_df: pd.DataFrame, a_spot: pd.DataFrame | None) -> tuple[pd.DataFrame, dict[str, float]]:
-    metrics = {"holding_contribution": np.nan, "top_weight": np.nan, "up_ratio": np.nan, "up_count": np.nan, "main_flow": np.nan}
+    metrics = {
+        "holding_contribution": np.nan,
+        "top_weight": np.nan,
+        "up_ratio": np.nan,
+        "up_count": np.nan,
+        "main_flow": np.nan,
+        "weighted_main_flow": np.nan,
+        "positive_flow_weight": np.nan,
+        "quote_coverage": np.nan,
+        "fund_flow_score": 50.0,
+    }
     if holdings_df is None or holdings_df.empty or "股票代码" not in holdings_df.columns:
         return pd.DataFrame(), metrics
     top = holdings_df.head(20).copy()
@@ -577,16 +608,40 @@ def holding_impact(holdings_df: pd.DataFrame, a_spot: pd.DataFrame | None) -> tu
         keep_cols = ["股票代码", "最新价", "涨跌幅", "成交额", "主力净流入-净额"]
         top = top.merge(a_spot[[col for col in keep_cols if col in a_spot.columns]], on="股票代码", how="left")
         if "占净值比例" in top.columns and "涨跌幅" in top.columns:
-            top["估算贡献"] = top["占净值比例"] * top["涨跌幅"] / 100
+            top["估算贡献"] = safe_weighted_contribution(top["占净值比例"], top["涨跌幅"])
             metrics["holding_contribution"] = float(top["估算贡献"].dropna().sum()) if top["估算贡献"].notna().any() else np.nan
         if "涨跌幅" in top.columns:
             pct = numeric_series(top["涨跌幅"]).dropna()
             if not pct.empty:
                 metrics["up_ratio"] = float((pct > 0).mean() * 100)
                 metrics["up_count"] = float((pct > 0).sum())
+                metrics["quote_coverage"] = float(len(pct) / max(len(top), 1) * 100)
         if "主力净流入-净额" in top.columns:
             flow = numeric_series(top["主力净流入-净额"]).dropna()
             metrics["main_flow"] = float(flow.sum()) if not flow.empty else np.nan
+            if "占净值比例" in top.columns:
+                weight = numeric_series(top["占净值比例"]).clip(lower=0, upper=100)
+                top["加权主力净额"] = numeric_series(top["主力净流入-净额"]) * weight / 100
+                weighted = top["加权主力净额"].dropna()
+                metrics["weighted_main_flow"] = float(weighted.sum()) if not weighted.empty else np.nan
+                valid = top[["占净值比例", "主力净流入-净额"]].copy()
+                valid["占净值比例"] = numeric_series(valid["占净值比例"])
+                valid["主力净流入-净额"] = numeric_series(valid["主力净流入-净额"])
+                valid = valid.dropna()
+                denom = valid["占净值比例"].clip(lower=0).sum()
+                if denom > 0:
+                    metrics["positive_flow_weight"] = float(valid.loc[valid["主力净流入-净额"] > 0, "占净值比例"].clip(lower=0).sum() / denom * 100)
+            metrics["fund_flow_score"] = clamp(
+                linear_score(metrics["weighted_main_flow"], -1.5e8, 1.5e8) * 0.45
+                + linear_score(metrics["positive_flow_weight"], 30, 70) * 0.35
+                + linear_score(metrics["main_flow"], -8e8, 8e8) * 0.20
+            )
+        if pd.isna(metrics["main_flow"]) and pd.notna(metrics["holding_contribution"]):
+            metrics["fund_flow_score"] = clamp(
+                linear_score(metrics["holding_contribution"], -0.7, 0.9) * 0.45
+                + linear_score(metrics["up_ratio"], 35, 70) * 0.35
+                + linear_score(metrics["quote_coverage"], 45, 90) * 0.20
+            )
     return top, metrics
 
 
@@ -632,20 +687,35 @@ def score_watch_item(
     top_weight = to_num(holding_metrics.get("top_weight"))
     up_ratio = to_num(holding_metrics.get("up_ratio"))
     main_flow = to_num(holding_metrics.get("main_flow"))
-    through_pct = contribution if pd.notna(contribution) else np.nan
-    realtime_pct = estimate_pct if pd.notna(estimate_pct) else (through_pct if pd.notna(through_pct) else daily_pct)
+    weighted_main_flow = to_num(holding_metrics.get("weighted_main_flow"))
+    positive_flow_weight = to_num(holding_metrics.get("positive_flow_weight"))
+    quote_coverage = to_num(holding_metrics.get("quote_coverage"))
+    fund_flow_score = to_num(holding_metrics.get("fund_flow_score"))
+    estimate_pct_safe = valid_realtime_pct(estimate_pct)
+    contribution_safe = valid_realtime_pct(contribution)
+    daily_pct_safe = valid_realtime_pct(daily_pct)
+    if pd.notna(estimate_pct_safe):
+        through_pct = estimate_pct_safe
+        through_source = "东财盘中估值"
+    elif pd.notna(contribution_safe) and pd.notna(quote_coverage) and quote_coverage >= 45:
+        through_pct = contribution_safe
+        through_source = "重仓股穿透估算"
+    else:
+        through_pct = daily_pct_safe
+        through_source = "净值日增长兜底"
+    realtime_pct = through_pct if pd.notna(through_pct) else daily_pct
     momentum_score = clamp(
         linear_score(realtime_pct, -2.5, 2.8) * 0.36
         + linear_score(ret5, -4.5, 6.5) * 0.24
         + linear_score(ret20, -9, 13) * 0.20
         + linear_score(positive_days5, 1, 4) * 0.20
     )
-    flow_score = linear_score(main_flow, -8e8, 8e8)
+    flow_score = fund_flow_score if pd.notna(fund_flow_score) else linear_score(main_flow, -8e8, 8e8)
     holding_score = clamp(
         linear_score(contribution, -1.1, 1.2) * 0.44
         + linear_score(up_ratio, 32, 70) * 0.26
-        + linear_score(top_weight, 20, 70) * 0.18
-        + flow_score * 0.12
+        + flow_score * 0.18
+        + linear_score(top_weight, 20, 70) * 0.12
     )
 
     if estimation_df is not None and "估算涨幅" in estimation_df.columns and pd.notna(estimate_pct):
@@ -714,6 +784,7 @@ def score_watch_item(
         macd=macd,
         dea=dea,
         macd_hist=macd_hist,
+        fund_flow_score=flow_score,
     )
 
     name = ""
@@ -737,7 +808,10 @@ def score_watch_item(
     if pd.isna(unit_nav):
         unit_nav = close
     estimated_nav = to_num(est_row.get("估算净值")) if est_row is not None else np.nan
-    through_nav = unit_nav * (1 + through_pct / 100) if pd.notna(unit_nav) and pd.notna(through_pct) else np.nan
+    if pd.notna(estimated_nav) and through_source == "东财盘中估值":
+        through_nav = estimated_nav
+    else:
+        through_nav = unit_nav * (1 + through_pct / 100) if pd.notna(unit_nav) and pd.notna(through_pct) else np.nan
     if pd.isna(estimated_nav) and pd.notna(through_nav):
         estimated_nav = through_nav
     realtime_through_pct = through_pct
@@ -754,10 +828,16 @@ def score_watch_item(
         "估算偏差": to_num(est_row.get("估算偏差")) if est_row is not None else np.nan,
         "实时穿透净值": through_nav,
         "实时穿透涨幅": realtime_through_pct,
+        "穿透来源": through_source,
         "重仓估算贡献": contribution,
         "前20持仓权重": top_weight,
         "上涨重仓股数": holding_metrics.get("up_count"),
         "上涨重仓股比例": up_ratio,
+        "重仓主力净额": main_flow,
+        "加权主力净额": weighted_main_flow,
+        "主力流入权重占比": positive_flow_weight,
+        "行情覆盖率": quote_coverage,
+        "资金确认分": flow_score,
         "近5日": ret5,
         "近10日": ret10,
         "近20日": ret20,
