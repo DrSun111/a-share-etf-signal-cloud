@@ -45,7 +45,3 @@ jobs:
         run: |
           python collector.py
           python otc_collector.py
-      - name: Database summary
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python db_admin.py summary
