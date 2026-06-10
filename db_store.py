@@ -12,6 +12,7 @@ import pandas as pd
 
 APP_DIR = Path(__file__).resolve().parent
 LOCAL_DB_PATH = APP_DIR / "data" / "etf_signal.db"
+_INITIALIZED_URLS: set[str] = set()
 
 
 def _secret_database_url() -> str | None:
@@ -91,6 +92,9 @@ def _execute(sql: str, params: tuple[Any, ...] | dict[str, Any] | None = None) -
 
 
 def init_db() -> None:
+    url = database_url()
+    if url in _INITIALIZED_URLS:
+        return
     statements = [
         """
         CREATE TABLE IF NOT EXISTS etf_spot_snapshot (
@@ -152,6 +156,7 @@ def init_db() -> None:
     ]
     for statement in statements:
         _execute(statement)
+    _INITIALIZED_URLS.add(url)
 
 
 def _json_ready_records(df: pd.DataFrame) -> list[dict[str, Any]]:
