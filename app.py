@@ -4,6 +4,7 @@ import json
 import math
 import re
 import html
+import time
 from datetime import date, datetime, timedelta
 from io import StringIO
 from pathlib import Path
@@ -69,6 +70,24 @@ def get_akshare():
     import akshare as ak
 
     return ak
+
+
+PERF_START = time.perf_counter()
+PERF_MARKS: list[dict[str, Any]] = []
+
+
+def perf_mark(label: str) -> None:
+    now = time.perf_counter()
+    previous = PERF_MARKS[-1]["累计秒"] if PERF_MARKS else 0.0
+    elapsed = round(now - PERF_START, 3)
+    PERF_MARKS.append({"阶段": label, "本段秒": round(elapsed - previous, 3), "累计秒": elapsed})
+
+
+def render_perf_diagnostics() -> None:
+    perf_mark("页面渲染完成")
+    with st.sidebar.expander("性能诊断", expanded=False):
+        st.caption("每次刷新都会重新统计；如果某一段超过 3 秒，基本就是卡点。")
+        st.dataframe(pd.DataFrame(PERF_MARKS), use_container_width=True, hide_index=True)
 DEFAULT_WATCHLIST = ["510300", "159915", "512000", "588000", "512880", "159949"]
 DEFAULT_OTC_WATCHLIST = ["110022", "161725", "005827", "001071", "000001"]
 
@@ -938,6 +957,33 @@ def open_fund_label_for_code(daily_df: pd.DataFrame | None, names_df: pd.DataFra
         if not hit.empty:
             return fund_label_from_row(hit.iloc[0])
     return f"{code} | 未取到基金名称"
+
+
+def open_fund_label_for_code(
+    daily_df: pd.DataFrame | None,
+    names_df: pd.DataFrame | None,
+    code: str,
+    snapshot_df: pd.DataFrame | None = None,
+) -> str:
+    code = clean_code(code)
+    row = latest_open_fund_row(daily_df, code)
+    if row is not None:
+        return fund_label_from_row(row)
+
+    for source_df in (names_df, snapshot_df):
+        if source_df is None or source_df.empty or "基金代码" not in source_df.columns:
+            continue
+        source = source_df.copy()
+        source["基金代码"] = source["基金代码"].astype(str).str.zfill(6)
+        hit = source[source["基金代码"] == code]
+        if hit.empty:
+            continue
+        found = hit.iloc[0]
+        if "场外短线评分" in found.index or "动作" in found.index:
+            return otc_watch_rank_label(found)
+        return fund_label_from_row(found)
+
+    return f"{code} | 等待后台采集名称"
 
 
 def open_fund_name_for_code(
@@ -2345,6 +2391,7 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+perf_mark("基础初始化")
 
 
 try:
@@ -2410,6 +2457,7 @@ with st.sidebar:
                 st.caption("当前未执行表统计；这能减少 Neon 查询等待。")
         except Exception as exc:  # noqa: BLE001
             st.warning(f"数据库暂不可用：{type(exc).__name__}: {exc}")
+perf_mark("侧边栏设置")
 
 if fund_mode == "场外基金" and otc_snapshot_mode:
     etf_spot, spot_status = None, data_status("ETF实时行情-东方财富", True, "场外后台快照模式已跳过")
@@ -2423,6 +2471,7 @@ elif db_read_mode or fast_refresh_mode:
             etf_spot, spot_status = live_spot, {"ok": live_status.get("ok"), "label": "快照为空，已回退实时ETF行情", "detail": live_status.get("detail")}
 else:
     etf_spot, spot_status = get_etf_spot()
+perf_mark("场内快照读取")
 
 if "selected_etf_code" not in st.session_state:
     st.session_state["selected_etf_code"] = "510300"
@@ -2473,6 +2522,7 @@ else:
     open_fund_daily, open_fund_daily_status = None, data_status("开放式基金净值-东方财富/天天基金", True, "场内模式未读取")
     fund_names, fund_names_status = None, data_status("全部基金名称-东方财富/天天基金", True, "场内模式未读取")
     open_fund_estimation, open_fund_estimation_status = None, data_status("场外基金盘中估值-东方财富", True, "场内模式未读取")
+perf_mark("场外基础表读取")
 
 
 with st.sidebar:
@@ -2568,7 +2618,7 @@ with st.sidebar:
                 st.rerun()
 
         otc_watchlist_text = st.text_area("场外自选代码", value=" ".join(otc_watchlist_codes), height=60)
-        otc_watchlist_label_options = [open_fund_label_for_code(open_fund_daily, fund_names, item) for item in otc_watchlist_codes]
+        otc_watchlist_label_options = [open_fund_label_for_code(open_fund_daily, fund_names, item, otc_watch_snapshot_df) for item in otc_watchlist_codes]
         if otc_watchlist_label_options:
             current_focus_code = clean_code(st.session_state.get("selected_otc_code", otc_code))
             focus_index = 0
@@ -2605,6 +2655,7 @@ with st.sidebar:
     lookback = st.slider("K线回看天数", min_value=120, max_value=900, value=420, step=30)
     leaderboard_size = st.slider("实时机会榜数量", min_value=10, max_value=80, value=30, step=10)
     st.caption("数据会按短 TTL 缓存。点击右上角 Rerun 可刷新。")
+perf_mark("参数读取")
 
 
 end_dt = date.today()
@@ -2703,6 +2754,7 @@ with st.spinner("正在读取实时数据..."):
         a_spot, a_spot_status = None, data_status("A股实时行情-东方财富", True, "极速模式已跳过")
     else:
         a_spot, a_spot_status = get_a_spot()
+perf_mark("实时/快照数据读取")
 
 
 if fund_mode == "场内ETF" and (daily_df is None or daily_df.empty):
@@ -2712,6 +2764,7 @@ if fund_mode == "场内ETF" and (daily_df is None or daily_df.empty):
             klass = "source-ok" if status.get("ok") else "source-bad"
             state = "OK" if status.get("ok") else "FAIL"
             st.markdown(f"<span class='{klass}'>{state}</span> {status.get('label')}: {status.get('detail')}", unsafe_allow_html=True)
+    render_perf_diagnostics()
     st.stop()
 
 
@@ -2776,6 +2829,7 @@ else:
     )
 otc_factor_scores = otc_model["factor_scores"]
 otc_raw = otc_model["raw"]
+perf_mark("模型计算")
 
 
 if fund_mode == "场外基金":
@@ -2816,9 +2870,12 @@ if fund_mode == "场外基金":
     otc_header_cols[4].metric("同类/热度分位", pct_text(to_num(otc_raw.get("peer_rank")), 1))
     otc_header_cols[5].metric("申/赎状态", f"{otc_row.get('申购状态', '-') if otc_row is not None else '-'} / {otc_row.get('赎回状态', '-') if otc_row is not None else '-'}")
 
-    otc_tabs = st.tabs(["机会评分", "净值与动量", "资金与穿透", "板块与市场", "持仓与资产", "自选池/查询", "模型"])
+    otc_view_options = ["机会评分", "净值与动量", "资金与穿透", "板块与市场", "持仓与资产", "自选池/查询", "模型"]
+    otc_view = st.segmented_control("场外视图", otc_view_options, default=otc_view_options[0], key="otc_view", label_visibility="collapsed")
+    if otc_view is None:
+        otc_view = otc_view_options[0]
 
-    with otc_tabs[0]:
+    if otc_view == otc_view_options[0]:
         factor_left, factor_right = st.columns([1.15, 1])
         with factor_left:
             st.plotly_chart(factor_bar(otc_factor_scores), use_container_width=True)
@@ -2891,7 +2948,7 @@ if fund_mode == "场外基金":
                 )
             st.dataframe(format_open_fund_display(rank_df), use_container_width=True, hide_index=True)
 
-    with otc_tabs[1]:
+    elif otc_view == otc_view_options[1]:
         if not otc_model["price_df"].empty:
             st.plotly_chart(otc_nav_analysis_chart(otc_model["price_df"], f"{otc_code} {otc_name}：净值趋势 / 涨跌 / MACD / 回撤"), use_container_width=True)
             otc_ind = add_indicators(otc_model["price_df"])
@@ -2911,7 +2968,7 @@ if fund_mode == "场外基金":
             st.plotly_chart(nav_trend_chart(otc_nav_df, f"{otc_code} {otc_name}：单位净值走势"), use_container_width=True)
         st.caption("净值动量会把后台快照里的实时穿透净值追加为最新点；DIF、DEA、MACD柱因此会反映当天重仓股穿透估算。")
 
-    with otc_tabs[2]:
+    elif otc_view == otc_view_options[2]:
         st.subheader("重仓股实时穿透")
         impact_cols = st.columns(5)
         impact_cols[0].metric("重仓股估算贡献", pct_text(otc_estimated_contribution))
@@ -2943,7 +3000,7 @@ if fund_mode == "场外基金":
         st.subheader("穿透解释")
         st.write("场外基金没有交易所盘口和逐笔成交，资金确认使用公开重仓股实时涨跌、重仓主力净额、上涨重仓股比例和持仓权重集中度作为代理。")
 
-    with otc_tabs[3]:
+    elif otc_view == otc_view_options[3]:
         left, right = st.columns([1.3, 1])
         with left:
             st.subheader("行业热度")
@@ -2962,7 +3019,7 @@ if fund_mode == "场外基金":
             else:
                 st.write(sector_info.get("note", "未映射到明确板块，按同类日表现和市场环境处理。"))
 
-    with otc_tabs[4]:
+    elif otc_view == otc_view_options[4]:
         left, right = st.columns([1, 1])
         with left:
             st.subheader("资产配置")
@@ -2986,7 +3043,7 @@ if fund_mode == "场外基金":
             else:
                 st.write("未取得阶段业绩。")
 
-    with otc_tabs[5]:
+    elif otc_view == otc_view_options[5]:
         watch_left, browse_right = st.columns([1, 1.15])
         with watch_left:
             st.subheader("场外基金自选池")
@@ -2996,7 +3053,7 @@ if fund_mode == "场外基金":
                 if "基金代码" in otc_watchlist_table.columns:
                     otc_watch_labels = [otc_watch_rank_label(row) for _, row in otc_watchlist_table.iterrows()]
                 else:
-                    otc_watch_labels = [open_fund_label_for_code(open_fund_daily, fund_names, item) for item in otc_watchlist_codes]
+                    otc_watch_labels = [open_fund_label_for_code(open_fund_daily, fund_names, item, otc_watch_snapshot_df) for item in otc_watchlist_codes]
                 current_watch_index = 0
                 for idx, label in enumerate(otc_watch_labels):
                     if extract_code_from_label(label) == otc_code:
@@ -3024,7 +3081,7 @@ if fund_mode == "场外基金":
             otc_browse_table = build_open_fund_watch_table(open_fund_daily, fund_names, browse_codes, open_fund_estimation)
             st.dataframe(format_open_fund_display(otc_browse_table), use_container_width=True, hide_index=True)
 
-    with otc_tabs[6]:
+    elif otc_view == otc_view_options[6]:
         st.subheader("场外基金评分公式")
         st.code("场外基金短线强度 = 趋势分*0.25 + 净值动能分*0.20 + 持仓穿透分*0.20 + 同类热度分*0.20 + 风险控制分*0.15", language="text")
         st.write(
@@ -3037,6 +3094,7 @@ if fund_mode == "场外基金":
         status_df = pd.DataFrame([{"数据源": s.get("label"), "状态": "OK" if s.get("ok") else "FAIL", "说明": s.get("detail")} for s in statuses])
         st.dataframe(status_df, use_container_width=True, hide_index=True)
 
+    render_perf_diagnostics()
     st.stop()
 
 
@@ -3095,9 +3153,12 @@ else:
     st.dataframe(format_realtime_display(preview.head(12)), use_container_width=True, hide_index=True)
     st.caption("完整自选池和全 ETF 查询仍在“自选池/查询”看板中。")
 
-tabs = st.tabs(["机会评分", "K线与量价", "资金与盘口", "板块与市场", "成分股穿透", "自选池/查询", "模型"])
+etf_view_options = ["机会评分", "K线与量价", "资金与盘口", "板块与市场", "成分股穿透", "自选池/查询", "模型"]
+etf_view = st.segmented_control("场内视图", etf_view_options, default=etf_view_options[0], key="etf_view", label_visibility="collapsed")
+if etf_view is None:
+    etf_view = etf_view_options[0]
 
-with tabs[0]:
+if etf_view == etf_view_options[0]:
     left, right = st.columns([1.3, 1])
     with left:
         st.plotly_chart(factor_bar(factor_scores), use_container_width=True)
@@ -3115,7 +3176,7 @@ with tabs[0]:
     rule_cols[3].metric("板块", f"{factor_scores['板块热度分']:.1f}")
     rule_cols[4].metric("风险", f"{factor_scores['风险控制分']:.1f}")
 
-with tabs[1]:
+elif etf_view == etf_view_options[1]:
     st.plotly_chart(candlestick_chart(daily_df, f"{code} {etf_name}：K线 / 均线 / 成交额 / MACD"), use_container_width=True)
     tech_cols = st.columns(7)
     tech_cols[0].metric("MA5", f"{latest.get('ma5', np.nan):.3f}")
@@ -3126,7 +3187,7 @@ with tabs[1]:
     tech_cols[5].metric("MFI14", f"{latest.get('mfi14', np.nan):.1f}")
     tech_cols[6].metric("ATR%", pct_text(raw.get("atr_pct")))
 
-with tabs[2]:
+elif etf_view == etf_view_options[2]:
     left, right = st.columns([1, 1])
     with left:
         st.subheader("实时资金与盘口")
@@ -3154,7 +3215,7 @@ with tabs[2]:
                 display_leaderboard[col] = display_leaderboard[col].map(lambda x: f"{x:.2f}" if pd.notna(x) else "-")
         st.dataframe(display_leaderboard, use_container_width=True, hide_index=True)
 
-with tabs[3]:
+elif etf_view == etf_view_options[3]:
     left, right = st.columns([1.3, 1])
     with left:
         st.subheader("行业热度")
@@ -3174,7 +3235,7 @@ with tabs[3]:
         else:
             st.write(sector_info.get("note", "未匹配到具体行业。"))
 
-with tabs[4]:
+elif etf_view == etf_view_options[4]:
     left, right = st.columns([1.1, 1])
     with left:
         st.subheader("基金概况")
@@ -3219,7 +3280,7 @@ with tabs[4]:
         else:
             st.write("未取得持仓数据。")
 
-with tabs[5]:
+elif etf_view == etf_view_options[5]:
     st.subheader("基金自选池实时盯盘")
     if watchlist_table.empty:
         st.info("自选池为空。可以在左侧搜索 ETF 后点击“加入自选”，也可以批量编辑代码。")
@@ -3260,7 +3321,7 @@ with tabs[5]:
         st.dataframe(format_realtime_display(browse_table), use_container_width=True, hide_index=True)
         st.caption(f"当前展示 {len(browse_table)} 条结果。空搜索默认按实时机会分和成交额排序。")
 
-with tabs[6]:
+elif etf_view == etf_view_options[6]:
     st.subheader("场内 ETF 评分公式")
     st.code("ETF短线强度 = 趋势分*0.25 + 量能分*0.20 + 资金分*0.20 + 板块热度分*0.20 + 风险控制分*0.15", language="text")
     st.write(
@@ -3300,4 +3361,5 @@ with tabs[6]:
         st.warning(f"数据库摘要读取失败：{type(exc).__name__}: {exc}")
     st.caption("公网免费接口存在延迟、限流、字段变化和临时不可用。实盘前建议接入券商或交易所授权行情源，并单独做回测和风控校验。")
 
+render_perf_diagnostics()
 st.stop()
