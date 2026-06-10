@@ -9,7 +9,6 @@ from io import StringIO
 from pathlib import Path
 from typing import Any
 
-import akshare as ak
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -18,7 +17,6 @@ import requests
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from collector import collect_market_snapshot
 from db_store import (
     database_summary,
     is_sqlite_url,
@@ -26,6 +24,7 @@ from db_store import (
     load_latest_otc_nav_history,
     load_latest_otc_watch_snapshot,
     load_latest_sector_heat,
+    masked_database_url,
     save_score_snapshot,
 )
 from db_store import load_watchlist as load_db_watchlist
@@ -57,6 +56,19 @@ def collect_otc_watch_snapshot(*args: Any, **kwargs: Any) -> dict[str, Any]:
     from otc_collector import collect_otc_watch_snapshot as _collect_otc_watch_snapshot
 
     return _collect_otc_watch_snapshot(*args, **kwargs)
+
+
+def collect_market_snapshot(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    from collector import collect_market_snapshot as _collect_market_snapshot
+
+    return _collect_market_snapshot(*args, **kwargs)
+
+
+@st.cache_resource(show_spinner=False)
+def get_akshare():
+    import akshare as ak
+
+    return ak
 DEFAULT_WATCHLIST = ["510300", "159915", "512000", "588000", "512880", "159949"]
 DEFAULT_OTC_WATCHLIST = ["110022", "161725", "005827", "001071", "000001"]
 
@@ -348,12 +360,12 @@ def run_call(label: str, fn, *args, **kwargs) -> tuple[pd.DataFrame | None, dict
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_etf_spot() -> tuple[pd.DataFrame | None, dict[str, Any]]:
-    return run_call("ETF实时行情-东方财富", ak.fund_etf_spot_em)
+    return run_call("ETF实时行情-东方财富", get_akshare().fund_etf_spot_em)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
 def get_open_fund_daily() -> tuple[pd.DataFrame | None, dict[str, Any]]:
-    df, status = run_call("开放式基金净值-东方财富/天天基金", ak.fund_open_fund_daily_em)
+    df, status = run_call("开放式基金净值-东方财富/天天基金", get_akshare().fund_open_fund_daily_em)
     if df is None:
         return None, status
     out = df.copy()
@@ -368,7 +380,7 @@ def get_open_fund_daily() -> tuple[pd.DataFrame | None, dict[str, Any]]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_fund_names() -> tuple[pd.DataFrame | None, dict[str, Any]]:
-    return run_call("全部基金名称-东方财富/天天基金", ak.fund_name_em)
+    return run_call("全部基金名称-东方财富/天天基金", get_akshare().fund_name_em)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -435,7 +447,7 @@ def get_open_fund_estimation_from_collector_cache() -> tuple[pd.DataFrame | None
 
 @st.cache_data(ttl=120, show_spinner=False)
 def get_open_fund_estimation() -> tuple[pd.DataFrame | None, dict[str, Any]]:
-    df, status = run_call("场外基金盘中估值-东方财富", ak.fund_value_estimation_em)
+    df, status = run_call("场外基金盘中估值-东方财富", get_akshare().fund_value_estimation_em)
     if df is None:
         return None, status
     out = df.copy()
@@ -512,7 +524,7 @@ def fetch_open_fund_nav_history_em(code: str, max_pages: int = 35) -> pd.DataFra
 
 @st.cache_data(ttl=900, show_spinner=False)
 def get_open_fund_nav_trend(code: str, indicator: str = "单位净值走势") -> tuple[pd.DataFrame | None, dict[str, Any]]:
-    df, status = run_call(f"场外基金{indicator}", ak.fund_open_fund_info_em, symbol=code, indicator=indicator, period="成立来")
+    df, status = run_call(f"场外基金{indicator}", get_akshare().fund_open_fund_info_em, symbol=code, indicator=indicator, period="成立来")
     if df is None:
         try:
             fallback = fetch_open_fund_nav_history_em(code)
@@ -575,12 +587,12 @@ def get_open_fund_nav_from_db(code: str) -> tuple[pd.DataFrame | None, dict[str,
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_open_fund_basic(code: str) -> tuple[pd.DataFrame | None, dict[str, Any]]:
-    return run_call("场外基金基本信息-雪球", ak.fund_individual_basic_info_xq, symbol=code)
+    return run_call("场外基金基本信息-雪球", get_akshare().fund_individual_basic_info_xq, symbol=code)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_open_fund_achievement(code: str) -> tuple[pd.DataFrame | None, dict[str, Any]]:
-    df, status = run_call("场外基金业绩-雪球", ak.fund_individual_achievement_xq, symbol=code)
+    df, status = run_call("场外基金业绩-雪球", get_akshare().fund_individual_achievement_xq, symbol=code)
     if df is None:
         return None, status
     out = df.copy()
@@ -592,7 +604,7 @@ def get_open_fund_achievement(code: str) -> tuple[pd.DataFrame | None, dict[str,
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_open_fund_asset_allocation(code: str) -> tuple[pd.DataFrame | None, dict[str, Any]]:
-    df, status = run_call("场外基金资产配置-雪球", ak.fund_individual_detail_hold_xq, symbol=code)
+    df, status = run_call("场外基金资产配置-雪球", get_akshare().fund_individual_detail_hold_xq, symbol=code)
     if df is None:
         return None, status
     out = df.copy()
@@ -606,7 +618,7 @@ def get_open_fund_holdings(code: str) -> tuple[pd.DataFrame | None, list[dict[st
     statuses: list[dict[str, Any]] = []
     current_year = date.today().year
     for year in range(current_year, current_year - 4, -1):
-        df, status = run_call(f"场外基金股票持仓-{year}", ak.fund_portfolio_hold_em, symbol=code, date=str(year))
+        df, status = run_call(f"场外基金股票持仓-{year}", get_akshare().fund_portfolio_hold_em, symbol=code, date=str(year))
         statuses.append(status)
         if df is not None:
             out = df.copy()
@@ -622,7 +634,7 @@ def get_etf_daily(code: str, start_date: str, end_date: str) -> tuple[pd.DataFra
     statuses: list[dict[str, Any]] = []
     df, status = run_call(
         "ETF日K-东方财富",
-        ak.fund_etf_hist_em,
+        get_akshare().fund_etf_hist_em,
         symbol=code,
         period="daily",
         start_date=start_date,
@@ -632,7 +644,7 @@ def get_etf_daily(code: str, start_date: str, end_date: str) -> tuple[pd.DataFra
     statuses.append(status)
 
     if df is None:
-        df, status = run_call("ETF日K-新浪", ak.fund_etf_hist_sina, symbol=market_symbol(code))
+        df, status = run_call("ETF日K-新浪", get_akshare().fund_etf_hist_sina, symbol=market_symbol(code))
         statuses.append(status)
 
     if df is None:
@@ -677,14 +689,14 @@ def get_index_daily(symbol: str, start_date: str, end_date: str) -> tuple[pd.Dat
     statuses: list[dict[str, Any]] = []
     df, status = run_call(
         "指数日K-东方财富",
-        ak.stock_zh_index_daily_em,
+        get_akshare().stock_zh_index_daily_em,
         symbol=symbol,
         start_date=start_date,
         end_date=end_date,
     )
     statuses.append(status)
     if df is None:
-        df, status = run_call("指数日K-新浪", ak.stock_zh_index_daily, symbol=symbol)
+        df, status = run_call("指数日K-新浪", get_akshare().stock_zh_index_daily, symbol=symbol)
         statuses.append(status)
     if df is None:
         return None, statuses
@@ -710,14 +722,14 @@ def get_index_daily(symbol: str, start_date: str, end_date: str) -> tuple[pd.Dat
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_fund_overview(code: str) -> tuple[pd.DataFrame | None, dict[str, Any]]:
-    return run_call("基金概况-东方财富", ak.fund_overview_em, symbol=code)
+    return run_call("基金概况-东方财富", get_akshare().fund_overview_em, symbol=code)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_fund_nav(code: str, start_date: str, end_date: str) -> tuple[pd.DataFrame | None, dict[str, Any]]:
     df, status = run_call(
         "ETF净值-东方财富",
-        ak.fund_etf_fund_info_em,
+        get_akshare().fund_etf_fund_info_em,
         fund=code,
         start_date=start_date,
         end_date=end_date,
@@ -736,7 +748,7 @@ def get_holdings(code: str) -> tuple[pd.DataFrame | None, list[dict[str, Any]]]:
     statuses: list[dict[str, Any]] = []
     current_year = date.today().year
     for year in range(current_year, current_year - 4, -1):
-        df, status = run_call(f"成分持仓-{year}", ak.fund_portfolio_hold_em, symbol=code, date=str(year))
+        df, status = run_call(f"成分持仓-{year}", get_akshare().fund_portfolio_hold_em, symbol=code, date=str(year))
         statuses.append(status)
         if df is not None:
             out = df.copy()
@@ -749,7 +761,7 @@ def get_holdings(code: str) -> tuple[pd.DataFrame | None, list[dict[str, Any]]]:
 
 @st.cache_data(ttl=180, show_spinner=False)
 def get_sector_summary() -> tuple[pd.DataFrame | None, dict[str, Any]]:
-    df, status = run_call("行业热度-同花顺", ak.stock_board_industry_summary_ths)
+    df, status = run_call("行业热度-同花顺", get_akshare().stock_board_industry_summary_ths)
     if df is None:
         return None, status
     out = df.copy()
@@ -777,7 +789,7 @@ def get_sector_summary() -> tuple[pd.DataFrame | None, dict[str, Any]]:
 
 @st.cache_data(ttl=180, show_spinner=False)
 def get_a_spot() -> tuple[pd.DataFrame | None, dict[str, Any]]:
-    return run_call("A股实时行情-东方财富", ak.stock_zh_a_spot_em)
+    return run_call("A股实时行情-东方财富", get_akshare().stock_zh_a_spot_em)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -820,6 +832,11 @@ def get_sector_summary_from_db() -> tuple[pd.DataFrame | None, dict[str, Any]]:
 @st.cache_data(ttl=30, show_spinner=False)
 def get_otc_watch_snapshot_from_db() -> tuple[pd.DataFrame | None, dict[str, Any]]:
     return load_latest_otc_watch_snapshot()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_database_summary_cached() -> dict[str, Any]:
+    return database_summary()
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -2380,9 +2397,17 @@ with st.sidebar:
             st.error(f"场外同步失败：{type(exc).__name__}: {exc}")
     with st.expander("数据库状态", expanded=False):
         try:
-            summary = database_summary()
-            st.write(f"{summary['backend']} ｜ {summary['url']}")
-            st.json({k: v for k, v in summary.items() if k not in {"backend", "url"}})
+            backend_label = "SQLite" if is_sqlite_url() else "PostgreSQL"
+            st.write(f"{backend_label} ｜ {masked_database_url()}")
+            st.caption("为避免拖慢页面，表行数统计改为手动刷新。")
+            refresh_summary = st.button("刷新数据库状态", use_container_width=True)
+            if refresh_summary:
+                get_database_summary_cached.clear()
+                with st.spinner("正在统计数据库状态..."):
+                    summary = get_database_summary_cached()
+                st.json({k: v for k, v in summary.items() if k not in {"backend", "url"}})
+            else:
+                st.caption("当前未执行表统计；这能减少 Neon 查询等待。")
         except Exception as exc:  # noqa: BLE001
             st.warning(f"数据库暂不可用：{type(exc).__name__}: {exc}")
 
@@ -3257,14 +3282,20 @@ with tabs[6]:
     st.dataframe(status_df, use_container_width=True, hide_index=True)
     st.subheader("数据库摘要")
     try:
-        summary = database_summary()
-        st.write(f"{summary['backend']} ｜ {summary['url']}")
-        db_rows = [
-            {"表": table, "行数": meta.get("rows"), "最新快照": meta.get("latest")}
-            for table, meta in summary.items()
-            if isinstance(meta, dict)
-        ]
-        st.dataframe(pd.DataFrame(db_rows), use_container_width=True, hide_index=True)
+        backend_label = "SQLite" if is_sqlite_url() else "PostgreSQL"
+        st.write(f"{backend_label} ｜ {masked_database_url()}")
+        if st.button("刷新数据库摘要", key="model_refresh_database_summary"):
+            get_database_summary_cached.clear()
+            with st.spinner("正在统计数据库摘要..."):
+                summary = get_database_summary_cached()
+            db_rows = [
+                {"表": table, "行数": meta.get("rows"), "最新快照": meta.get("latest")}
+                for table, meta in summary.items()
+                if isinstance(meta, dict)
+            ]
+            st.dataframe(pd.DataFrame(db_rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("数据库摘要会扫描表行数，已改为手动刷新以提升页面响应。")
     except Exception as exc:  # noqa: BLE001
         st.warning(f"数据库摘要读取失败：{type(exc).__name__}: {exc}")
     st.caption("公网免费接口存在延迟、限流、字段变化和临时不可用。实盘前建议接入券商或交易所授权行情源，并单独做回测和风控校验。")
