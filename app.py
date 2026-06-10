@@ -348,6 +348,176 @@ def percentile_score(value: float, series: pd.Series, higher_is_better: bool = T
     return clamp(rank if higher_is_better else 100 - rank)
 
 
+def otc_position_signal_from_values(
+    total_score: float,
+    trend_score: float,
+    momentum_score: float,
+    holding_score: float,
+    heat_score: float,
+    risk_score: float,
+    market_score: float = 50.0,
+    ret5: float = np.nan,
+    ret10: float = np.nan,
+    ret20: float = np.nan,
+    through_pct: float = np.nan,
+    contribution: float = np.nan,
+    up_ratio: float = np.nan,
+    drawdown120: float = np.nan,
+    dif: float = np.nan,
+    dea: float = np.nan,
+    macd_hist: float = np.nan,
+) -> dict[str, Any]:
+    trend_score = clamp(trend_score)
+    momentum_score = clamp(momentum_score)
+    holding_score = clamp(holding_score)
+    heat_score = clamp(heat_score)
+    risk_score = clamp(risk_score)
+    market_score = clamp(market_score)
+    total_score = clamp(total_score)
+
+    realtime_confirm = (
+        (pd.notna(through_pct) and through_pct > 0)
+        or (pd.notna(contribution) and contribution > 0.08)
+        or (pd.notna(up_ratio) and up_ratio >= 55)
+    )
+    macd_confirm = pd.notna(dif) and pd.notna(dea) and dif >= dea
+    if pd.notna(macd_hist):
+        macd_confirm = macd_confirm or macd_hist > 0
+    not_overheated = not (
+        (pd.notna(ret5) and ret5 > 8)
+        or (pd.notna(ret10) and ret10 > 12)
+        or (pd.notna(through_pct) and through_pct > 3.5)
+    )
+    risk_block = risk_score < 45 or (pd.notna(drawdown120) and drawdown120 > 18)
+    trend_block = trend_score < 42 and momentum_score < 48
+
+    build_score = clamp(
+        trend_score * 0.22
+        + momentum_score * 0.20
+        + holding_score * 0.16
+        + heat_score * 0.14
+        + risk_score * 0.18
+        + market_score * 0.10
+        + (5 if realtime_confirm else -4)
+        + (4 if macd_confirm else 0)
+        + (4 if pd.notna(ret20) and ret20 > 0 else 0)
+        - (12 if risk_block else 0)
+        - (8 if not not_overheated else 0)
+    )
+    add_score = clamp(
+        trend_score * 0.26
+        + momentum_score * 0.20
+        + holding_score * 0.20
+        + heat_score * 0.16
+        + risk_score * 0.10
+        + market_score * 0.08
+        + (6 if realtime_confirm else -6)
+        + (5 if macd_confirm else 0)
+        + (4 if pd.notna(ret5) and ret5 > 1.5 else 0)
+        - (14 if risk_block else 0)
+        - (10 if not not_overheated else 0)
+    )
+
+    if risk_block or trend_block or not not_overheated:
+        build_signal = "暂不建仓"
+    elif build_score >= 76 and trend_score >= 60 and risk_score >= 55 and market_score >= 42:
+        build_signal = "建仓确认"
+    elif build_score >= 66 and risk_score >= 50 and (realtime_confirm or macd_confirm):
+        build_signal = "小仓试探"
+    elif build_score >= 58:
+        build_signal = "观察等确认"
+    else:
+        build_signal = "暂不建仓"
+
+    if risk_block or not not_overheated:
+        add_signal = "禁止加仓"
+    elif add_score >= 80 and trend_score >= 68 and momentum_score >= 60 and holding_score >= 55 and market_score >= 42:
+        add_signal = "顺势加仓"
+    elif add_score >= 70 and trend_score >= 58 and realtime_confirm:
+        add_signal = "轻度加仓"
+    elif add_score >= 60:
+        add_signal = "持仓观察"
+    else:
+        add_signal = "不加仓"
+
+    if add_signal in {"顺势加仓", "轻度加仓"}:
+        position_action = add_signal
+    elif build_signal in {"建仓确认", "小仓试探"}:
+        position_action = build_signal
+    elif risk_block:
+        position_action = "风险回避"
+    elif not not_overheated:
+        position_action = "防追高"
+    else:
+        position_action = "等待"
+
+    reasons = []
+    if trend_score >= 60:
+        reasons.append("趋势成立")
+    if realtime_confirm:
+        reasons.append("穿透确认")
+    if macd_confirm:
+        reasons.append("MACD确认")
+    if heat_score >= 60:
+        reasons.append("同类/板块前排")
+    if risk_score >= 55 and not_overheated:
+        reasons.append("风险可控")
+    if risk_block:
+        reasons.append("回撤/风险偏高")
+    if not not_overheated:
+        reasons.append("短线过热")
+    if not reasons:
+        reasons.append("信号不足")
+
+    return {
+        "建仓评分": build_score,
+        "建仓信号": build_signal,
+        "加仓评分": add_score,
+        "加仓信号": add_signal,
+        "仓位动作": position_action,
+        "信号依据": "、".join(reasons[:4]),
+    }
+
+
+def otc_position_signal_from_row(row: pd.Series | dict[str, Any], market_score: float = 50.0) -> dict[str, Any]:
+    return otc_position_signal_from_values(
+        total_score=to_num(row.get("场外短线评分")),
+        trend_score=to_num(row.get("趋势分")),
+        momentum_score=to_num(row.get("净值动能分")),
+        holding_score=to_num(row.get("持仓穿透分")),
+        heat_score=to_num(row.get("同类热度分")),
+        risk_score=to_num(row.get("风险控制分")),
+        market_score=market_score,
+        ret5=to_num(row.get("近5日")),
+        ret10=to_num(row.get("近10日")),
+        ret20=to_num(row.get("近20日")),
+        through_pct=to_num(row.get("实时穿透涨幅", row.get("估算涨幅"))),
+        contribution=to_num(row.get("重仓估算贡献")),
+        up_ratio=to_num(row.get("上涨重仓股比例")),
+        drawdown120=to_num(row.get("120日回撤")),
+        dif=to_num(row.get("DIF")),
+        dea=to_num(row.get("DEA")),
+        macd_hist=to_num(row.get("MACD柱")),
+    )
+
+
+def ensure_otc_position_columns(df: pd.DataFrame, market_score: float = 50.0) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    needed = ["建仓评分", "建仓信号", "加仓评分", "加仓信号", "仓位动作", "信号依据"]
+    if all(col in out.columns for col in needed):
+        return out
+    signals = [otc_position_signal_from_row(row, market_score=market_score) for _, row in out.iterrows()]
+    signal_df = pd.DataFrame(signals, index=out.index)
+    for col in needed:
+        if col not in out.columns:
+            out[col] = signal_df[col]
+        else:
+            out[col] = out[col].where(out[col].notna() & (out[col].astype(str).str.strip() != ""), signal_df[col])
+    return out
+
+
 def format_money(value: float) -> str:
     if pd.isna(value):
         return "-"
@@ -1697,6 +1867,26 @@ def score_open_fund_model(
         action = f"{action}（轻仓）"
         action_tone = "warn"
 
+    position_signal = otc_position_signal_from_values(
+        total_score=total,
+        trend_score=trend_score,
+        momentum_score=momentum_score,
+        holding_score=holding_score,
+        heat_score=peer_score,
+        risk_score=risk_score,
+        market_score=market_env.get("score", 50),
+        ret5=ret5,
+        ret10=ret10,
+        ret20=ret20,
+        through_pct=daily_pct,
+        contribution=contribution,
+        up_ratio=up_ratio,
+        drawdown120=drawdown120,
+        dif=to_num(last.get("macd")),
+        dea=to_num(last.get("macd_signal")),
+        macd_hist=to_num(last.get("macd_hist")),
+    )
+
     positives: list[str] = []
     negatives: list[str] = []
     if above_ma >= 3 and alignment >= 2:
@@ -1719,6 +1909,10 @@ def score_open_fund_model(
         positives.append("回撤、波动、集中度和短期过热约束仍可接受")
     elif risk_score < 45:
         negatives.append("位置或回撤风险偏高，宜等待净值回撤/修复确认")
+    if position_signal["仓位动作"] in {"建仓确认", "小仓试探", "轻度加仓", "顺势加仓"}:
+        positives.append(f"仓位信号：{position_signal['仓位动作']}，依据：{position_signal['信号依据']}")
+    elif position_signal["仓位动作"] in {"风险回避", "防追高"}:
+        negatives.append(f"仓位信号：{position_signal['仓位动作']}，依据：{position_signal['信号依据']}")
 
     return {
         "price_df": price_df,
@@ -1752,6 +1946,7 @@ def score_open_fund_model(
             "drawdown120": drawdown120,
             "volatility20": volatility20,
             "max_drawdown": max_dd,
+            **position_signal,
         },
     }
 
@@ -1955,7 +2150,7 @@ def format_open_fund_display(df: pd.DataFrame) -> pd.DataFrame:
             out[col] = out[col].map(lambda x: f"{to_num(x):.4f}" if pd.notna(to_num(x)) else "-")
     if "场外机会分" in out:
         out["场外机会分"] = out["场外机会分"].map(lambda x: f"{to_num(x):.1f}" if pd.notna(to_num(x)) else "-")
-    for col in ["场外短线评分", "趋势分", "净值动能分", "持仓穿透分", "同类热度分", "风险控制分"]:
+    for col in ["场外短线评分", "趋势分", "净值动能分", "持仓穿透分", "同类热度分", "风险控制分", "建仓评分", "加仓评分"]:
         if col in out:
             out[col] = out[col].map(lambda x: f"{to_num(x):.1f}" if pd.notna(to_num(x)) else "-")
     for col in ["DIF", "DEA", "MACD柱"]:
@@ -1963,7 +2158,8 @@ def format_open_fund_display(df: pd.DataFrame) -> pd.DataFrame:
             out[col] = out[col].map(lambda x: f"{to_num(x):.4f}" if pd.notna(to_num(x)) else "-")
     if "上涨重仓股数" in out:
         out["上涨重仓股数"] = out["上涨重仓股数"].map(lambda x: f"{to_num(x):.0f}" if pd.notna(to_num(x)) else "-")
-    cols = ["基金代码", "基金简称", "基金类型", "场外短线评分", "动作", "估算涨幅", "实时穿透涨幅", "重仓估算贡献", "近5日", "近20日", "120日回撤"]
+    cols = ["基金代码", "基金简称", "基金类型", "场外短线评分", "动作", "建仓评分", "建仓信号", "加仓评分", "加仓信号", "仓位动作", "信号依据"]
+    cols += ["估算涨幅", "实时穿透涨幅", "重仓估算贡献", "近5日", "近20日", "120日回撤"]
     cols += ["实时穿透净值", "估算净值", "估算偏差", "最新单位净值", "日增长率", "前20持仓权重", "上涨重仓股数", "上涨重仓股比例", "DIF", "DEA", "MACD柱"]
     cols += ["场外机会分", "盯盘提示", "申购状态", "赎回状态", "手续费", "快照时间"]
     cols += [col for col in out.columns if ("单位净值" in col or "累计净值" in col or col in {"公布日增长率", "公布单位净值", "上一净值", "估算日期", "数据来源"}) and col not in cols]
@@ -2008,7 +2204,7 @@ def snapshot_to_estimation_row(row: pd.Series | None) -> pd.Series | None:
     )
 
 
-def filter_otc_snapshot_table(snapshot_df: pd.DataFrame | None, codes: list[str]) -> pd.DataFrame:
+def filter_otc_snapshot_table(snapshot_df: pd.DataFrame | None, codes: list[str], market_score: float = 50.0) -> pd.DataFrame:
     codes = normalize_code_list(codes)
     if snapshot_df is None or snapshot_df.empty or "基金代码" not in snapshot_df.columns:
         if not codes:
@@ -2027,6 +2223,7 @@ def filter_otc_snapshot_table(snapshot_df: pd.DataFrame | None, codes: list[str]
     if "场外短线评分" in df.columns:
         df["场外短线评分"] = numeric_series(df["场外短线评分"])
         df = df.sort_values("场外短线评分", ascending=False, na_position="last")
+    df = ensure_otc_position_columns(df, market_score=market_score)
     return df.reset_index(drop=True)
 
 
@@ -2116,6 +2313,11 @@ def open_fund_model_from_snapshot(row: pd.Series | None, nav_df: pd.DataFrame | 
         negatives.append(f"后台快照动作提示为：{action}")
     if to_num(row.get("120日回撤")) > 12:
         negatives.append(f"120日回撤约 {to_num(row.get('120日回撤')):.2f}%，位置风险偏高")
+    position_signal = otc_position_signal_from_row(row, market_score=market_env.get("score", 50))
+    if position_signal["仓位动作"] in {"建仓确认", "小仓试探", "轻度加仓", "顺势加仓"}:
+        positives.append(f"仓位信号：{position_signal['仓位动作']}，依据：{position_signal['信号依据']}")
+    elif position_signal["仓位动作"] in {"风险回避", "防追高"}:
+        negatives.append(f"仓位信号：{position_signal['仓位动作']}，依据：{position_signal['信号依据']}")
 
     return {
         "price_df": price_df,
@@ -2148,6 +2350,7 @@ def open_fund_model_from_snapshot(row: pd.Series | None, nav_df: pd.DataFrame | 
             "drawdown120": to_num(row.get("120日回撤")),
             "volatility20": np.nan,
             "max_drawdown": np.nan,
+            **position_signal,
         },
     }
 
@@ -2797,9 +3000,10 @@ leaderboard = build_etf_leaderboard(etf_spot, leaderboard_size)
 watchlist_table = build_realtime_etf_table(etf_spot, codes=watchlist_codes)
 etf_holding_impact, etf_estimated_contribution = build_holding_impact_table(holdings_df, a_spot)
 if otc_snapshot_mode and otc_watch_snapshot_df is not None and not otc_watch_snapshot_df.empty:
-    otc_watchlist_table = filter_otc_snapshot_table(otc_watch_snapshot_df, otc_watchlist_codes)
+    otc_watchlist_table = filter_otc_snapshot_table(otc_watch_snapshot_df, otc_watchlist_codes, market_score=market_env.get("score", 50))
 else:
     otc_watchlist_table = build_open_fund_watch_table(open_fund_daily, fund_names, otc_watchlist_codes, open_fund_estimation)
+    otc_watchlist_table = ensure_otc_position_columns(otc_watchlist_table, market_score=market_env.get("score", 50))
 otc_row = latest_open_fund_row(open_fund_daily, otc_code)
 if otc_row is None:
     otc_row = snapshot_to_open_fund_row(otc_snapshot_focus_row)
@@ -2905,6 +3109,11 @@ if fund_mode == "场外基金":
         otc_detail_cols[3].metric("重仓估算贡献", pct_text(to_num(otc_raw.get("holding_contribution"))))
         otc_detail_cols[4].metric("前20持仓权重", pct_text(to_num(otc_raw.get("top_weight"))))
         otc_detail_cols[5].metric("120日回撤", pct_text(to_num(otc_raw.get("drawdown120"))))
+        position_cols = st.columns(4)
+        position_cols[0].metric("建仓评分", f"{to_num(otc_raw.get('建仓评分')):.1f}" if pd.notna(to_num(otc_raw.get("建仓评分"))) else "-")
+        position_cols[1].metric("建仓信号", str(otc_raw.get("建仓信号") or "-"))
+        position_cols[2].metric("加仓评分", f"{to_num(otc_raw.get('加仓评分')):.1f}" if pd.notna(to_num(otc_raw.get("加仓评分"))) else "-")
+        position_cols[3].metric("加仓信号", str(otc_raw.get("加仓信号") or "-"))
 
         st.subheader("场外自选基金短线操作评分排行")
         if otc_watchlist_table.empty:
@@ -2922,10 +3131,36 @@ if fund_mode == "场外基金":
                         y=name_col,
                         color="动作" if "动作" in chart_df.columns else None,
                         orientation="h",
-                        hover_data=[col for col in ["基金代码", "估算涨幅", "实时穿透涨幅", "重仓估算贡献", "近5日", "120日回撤", "快照时间"] if col in chart_df.columns],
+                        hover_data=[col for col in ["基金代码", "建仓评分", "建仓信号", "加仓评分", "加仓信号", "仓位动作", "估算涨幅", "实时穿透涨幅", "重仓估算贡献", "近5日", "120日回撤", "快照时间"] if col in chart_df.columns],
                     )
                     fig.update_layout(height=max(260, min(520, 42 * len(chart_df) + 120)), margin=dict(l=10, r=10, t=10, b=10))
                     st.plotly_chart(fig, use_container_width=True)
+            signal_score_cols = [col for col in ["建仓评分", "加仓评分"] if col in rank_df.columns]
+            if len(signal_score_cols) == 2:
+                signal_chart_df = rank_df.copy()
+                for col in signal_score_cols:
+                    signal_chart_df[col] = numeric_series(signal_chart_df[col])
+                signal_chart_df = signal_chart_df.dropna(subset=signal_score_cols, how="all")
+                if not signal_chart_df.empty:
+                    name_col = "基金简称" if "基金简称" in signal_chart_df.columns else "基金代码"
+                    long_df = signal_chart_df.melt(
+                        id_vars=[col for col in ["基金代码", name_col, "建仓信号", "加仓信号", "仓位动作"] if col in signal_chart_df.columns],
+                        value_vars=signal_score_cols,
+                        var_name="信号类型",
+                        value_name="评分",
+                    )
+                    fig_signal = px.bar(
+                        long_df,
+                        x="评分",
+                        y=name_col,
+                        color="信号类型",
+                        orientation="h",
+                        barmode="group",
+                        range_x=[0, 100],
+                        hover_data=[col for col in ["基金代码", "建仓信号", "加仓信号", "仓位动作"] if col in long_df.columns],
+                    )
+                    fig_signal.update_layout(height=max(260, min(560, 50 * len(signal_chart_df) + 120)), margin=dict(l=10, r=10, t=10, b=10))
+                    st.plotly_chart(fig_signal, use_container_width=True)
             rank_labels = [otc_watch_rank_label(row) for _, row in rank_df.iterrows()]
             if rank_labels:
                 current_rank_index = 0
@@ -3088,6 +3323,8 @@ if fund_mode == "场外基金":
             "减仓：净值跌破20日线，或重仓股估算贡献小于 -0.30% 且上涨重仓股比例偏低，或120日回撤超过12%。"
             "离场：净值跌破60日线，并且同类热度分低于48或持仓穿透分低于45。"
         )
+        st.write("建仓评分：更看重趋势刚确认、净值动能转强、实时穿透为正、同类/板块升温，同时要求不过热、回撤风险可控。")
+        st.write("加仓评分：更看重已成立趋势的延续、MACD/DIF-DEA确认、重仓股穿透继续贡献、同类热度仍在前排；短线过热或回撤风险偏高时禁止加仓。")
         render_model_references()
         st.subheader("数据源状态")
         statuses = [otc_watch_snapshot_status, open_fund_daily_status, open_fund_estimation_status, fund_names_status, otc_nav_status, otc_basic_status, otc_achievement_status, otc_asset_status, *otc_holdings_statuses, *index_statuses, sector_status, a_spot_status]
