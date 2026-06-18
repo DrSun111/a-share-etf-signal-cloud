@@ -21,10 +21,13 @@ from plotly.subplots import make_subplots
 from db_store import (
     database_summary,
     is_sqlite_url,
+    load_etf_spot_history,
     load_latest_etf_spot,
     load_latest_otc_nav_history,
     load_latest_otc_watch_snapshot,
     load_latest_sector_heat,
+    load_otc_watch_history,
+    load_sector_heat_history,
     masked_database_url,
     save_score_snapshot,
 )
@@ -490,6 +493,17 @@ def otc_position_signal_from_values(
     if not reasons:
         reasons.append("信号不足")
 
+    build_probability = clamp(build_score * 0.62 + fund_flow_score * 0.14 + heat_score * 0.10 + risk_score * 0.14)
+    add_probability = clamp(add_score * 0.62 + fund_flow_score * 0.16 + trend_score * 0.12 + heat_score * 0.10)
+    reduce_probability = clamp(
+        (100 - risk_score) * 0.34
+        + (100 - trend_score) * 0.20
+        + (100 - fund_flow_score) * 0.18
+        + (100 - heat_score) * 0.12
+        + linear_score(drawdown120, 3, 18) * 0.16
+    )
+    best_probability = max([("建仓", build_probability), ("加仓", add_probability), ("减仓", reduce_probability)], key=lambda item: item[1])
+
     return {
         "建仓评分": build_score,
         "建仓信号": build_signal,
@@ -497,6 +511,10 @@ def otc_position_signal_from_values(
         "加仓信号": add_signal,
         "仓位动作": position_action,
         "信号依据": "、".join(reasons[:4]),
+        "建仓概率": build_probability,
+        "加仓概率": add_probability,
+        "减仓概率": reduce_probability,
+        "概率标签": f"{best_probability[0]}{probability_label(best_probability[1])}",
     }
 
 
@@ -537,6 +555,51 @@ def ensure_otc_position_columns(df: pd.DataFrame, market_score: float = 50.0) ->
             out[col] = signal_df[col]
         else:
             out[col] = out[col].where(out[col].notna() & (out[col].astype(str).str.strip() != ""), signal_df[col])
+    return out
+
+
+def otc_probability_from_row(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
+    total = to_num(row.get("场外短线评分", row.get("场外机会分")))
+    build_score = first_valid(to_num(row.get("建仓评分")), total)
+    add_score = first_valid(to_num(row.get("加仓评分")), total)
+    risk_score = to_num(row.get("风险控制分"))
+    trend_score = to_num(row.get("趋势分"))
+    flow_score = first_valid(to_num(row.get("资金连续性分")), to_num(row.get("资金确认分")))
+    heat_score = first_valid(to_num(row.get("板块持续性分")), to_num(row.get("同类热度分")))
+    freshness = to_num(row.get("快照可信度"))
+    if pd.isna(freshness):
+        freshness = to_num(snapshot_freshness(row).get("快照可信度"))
+    reduce_base = clamp((100 - risk_score) * 0.32 + (100 - trend_score) * 0.20 + (100 - flow_score) * 0.18 + (100 - heat_score) * 0.12 + linear_score(to_num(row.get("120日回撤")), 3, 18) * 0.18)
+    action = str(row.get("动作") or row.get("仓位动作") or "")
+    if "减仓" in action or "风险" in action:
+        reduce_base = clamp(reduce_base + 10)
+    if "离场" in action or "禁止" in action:
+        reduce_base = clamp(reduce_base + 16)
+    build_prob = calibrated_probability(build_score, 50.0, 0, freshness, flow_score * 0.46 + heat_score * 0.34 + risk_score * 0.20)
+    add_prob = calibrated_probability(add_score, 50.0, 0, freshness, flow_score * 0.44 + heat_score * 0.24 + trend_score * 0.32)
+    reduce_prob = calibrated_probability(reduce_base, 50.0, 0, freshness, (100 - flow_score) * 0.36 + (100 - heat_score) * 0.24 + (100 - risk_score) * 0.40)
+    best_action = max([("建仓", build_prob), ("加仓", add_prob), ("减仓", reduce_prob)], key=lambda item: item[1])
+    return {
+        "建仓概率": build_prob,
+        "加仓概率": add_prob,
+        "减仓概率": reduce_prob,
+        "概率标签": f"{best_action[0]}{probability_label(best_action[1])}",
+        "快照可信度": freshness,
+    }
+
+
+def ensure_otc_prediction_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    needed = ["建仓概率", "加仓概率", "减仓概率", "概率标签", "快照可信度"]
+    predictions = [otc_probability_from_row(row) for _, row in out.iterrows()]
+    pred_df = pd.DataFrame(predictions, index=out.index)
+    for col in needed:
+        if col not in out.columns:
+            out[col] = pred_df[col]
+        else:
+            out[col] = out[col].where(out[col].notna() & (out[col].astype(str).str.strip() != ""), pred_df[col])
     return out
 
 
@@ -594,6 +657,13 @@ def pct_text(value: float, digits: int = 2) -> str:
     if pd.isna(value):
         return "-"
     return f"{value:.{digits}f}%"
+
+
+def score_text(value: float, digits: int = 1) -> str:
+    value = to_num(value)
+    if pd.isna(value):
+        return "-"
+    return f"{value:.{digits}f}"
 
 
 def run_call(label: str, fn, *args, **kwargs) -> tuple[pd.DataFrame | None, dict[str, Any]]:
@@ -1082,6 +1152,21 @@ def get_otc_watch_snapshot_from_db() -> tuple[pd.DataFrame | None, dict[str, Any
     return load_latest_otc_watch_snapshot()
 
 
+@st.cache_data(ttl=90, show_spinner=False)
+def get_etf_spot_history_from_db(code: str, limit: int = 40) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    return load_etf_spot_history(clean_code(code), limit)
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def get_otc_watch_history_from_db(code: str, limit: int = 40) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    return load_otc_watch_history(clean_code(code), limit)
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def get_sector_heat_history_from_db(sector: str | None, limit: int = 40) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    return load_sector_heat_history(sector, limit)
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def get_database_summary_cached() -> dict[str, Any]:
     return database_summary()
@@ -1138,6 +1223,364 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["amount_ratio5"] = out["amount"] / out["amount_ma5"]
     out["amount_ratio20"] = out["amount"] / out["amount_ma20"]
     return out
+
+
+def parse_timestamp(value: Any) -> pd.Timestamp | None:
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return ts
+
+
+def freshness_from_timestamp(value: Any) -> dict[str, Any]:
+    ts = parse_timestamp(value)
+    if ts is None:
+        return {"快照可信度": 50.0, "快照年龄分钟": np.nan, "快照状态": "未知"}
+    now = pd.Timestamp.now(tz=ts.tz) if getattr(ts, "tz", None) is not None else pd.Timestamp.now()
+    age_minutes = max(0.0, (now - ts).total_seconds() / 60)
+    if age_minutes <= 10:
+        score = 96.0
+        label = "极新"
+    elif age_minutes <= 30:
+        score = 88.0
+        label = "可用"
+    elif age_minutes <= 90:
+        score = 74.0
+        label = "偏旧"
+    elif age_minutes <= 240:
+        score = 58.0
+        label = "需刷新"
+    else:
+        score = max(20.0, 58.0 - min(38.0, (age_minutes - 240) / 30))
+        label = "过旧"
+    return {"快照可信度": clamp(score), "快照年龄分钟": age_minutes, "快照状态": label}
+
+
+def snapshot_freshness(row: pd.Series | dict[str, Any] | None, history_df: pd.DataFrame | None = None) -> dict[str, Any]:
+    candidates: list[Any] = []
+    if history_df is not None and not history_df.empty and "_snapshot_ts" in history_df.columns:
+        candidates.append(history_df["_snapshot_ts"].iloc[-1])
+    if row is not None:
+        for col in ["_snapshot_ts", "快照时间", "更新时间", "估算日期", "日期"]:
+            try:
+                candidates.append(row.get(col))
+            except AttributeError:
+                pass
+    for value in candidates:
+        result = freshness_from_timestamp(value)
+        if pd.notna(result["快照年龄分钟"]):
+            return result
+    return freshness_from_timestamp(None)
+
+
+def flow_continuity_score(history_df: pd.DataFrame | None, mode: str = "etf") -> dict[str, Any]:
+    if history_df is None or history_df.empty:
+        return {"资金连续性分": 50.0, "资金连续状态": "样本不足", "资金连续样本": 0, "资金连续流入次数": 0, "资金连续流入占比": np.nan}
+    df = history_df.tail(16).copy()
+    if mode == "otc":
+        score_series = numeric_series(df.get("资金确认分", pd.Series(np.nan, index=df.index)))
+        amount = numeric_series(df.get("加权主力净额", df.get("重仓主力净额", pd.Series(np.nan, index=df.index))))
+        values = amount.where(amount.notna(), score_series - 50)
+        positive = (score_series >= 58) | (amount > 0)
+    else:
+        ratio = numeric_series(df.get("主力净流入-净占比", pd.Series(np.nan, index=df.index)))
+        amount = numeric_series(df.get("主力净流入-净额", pd.Series(np.nan, index=df.index)))
+        values = ratio.where(ratio.notna(), amount)
+        positive = (ratio > 0) | (amount > 0)
+    values = numeric_series(values).dropna()
+    positive = positive.loc[values.index] if not values.empty else pd.Series(dtype=bool)
+    samples = int(len(values))
+    if samples == 0:
+        return {"资金连续性分": 50.0, "资金连续状态": "无资金字段", "资金连续样本": 0, "资金连续流入次数": 0, "资金连续流入占比": np.nan}
+
+    recent_positive = positive.tail(min(8, samples))
+    positive_ratio = float(recent_positive.mean() * 100)
+    streak = 0
+    for flag in reversed(recent_positive.tolist()):
+        if flag:
+            streak += 1
+        else:
+            break
+    latest_rank = percentile_score(values.iloc[-1], values)
+    scale = values.abs().median()
+    slope = (values.iloc[-1] - values.iloc[0]) / scale if pd.notna(scale) and scale else np.nan
+    score = clamp(
+        linear_score(positive_ratio, 25, 80) * 0.36
+        + linear_score(streak, 0, 4) * 0.24
+        + latest_rank * 0.22
+        + linear_score(slope, -0.8, 1.0) * 0.18
+    )
+    if score >= 72:
+        label = "连续流入"
+    elif score >= 60:
+        label = "资金转强"
+    elif score >= 45:
+        label = "中性震荡"
+    elif streak == 0 and positive_ratio < 35:
+        label = "连续流出"
+    else:
+        label = "资金转弱"
+    return {
+        "资金连续性分": score,
+        "资金连续状态": label,
+        "资金连续样本": samples,
+        "资金连续流入次数": int(recent_positive.sum()),
+        "资金连续流入占比": positive_ratio,
+    }
+
+
+def normalize_sector_history(history_df: pd.DataFrame | None) -> pd.DataFrame:
+    if history_df is None or history_df.empty:
+        return pd.DataFrame()
+    out = history_df.copy()
+    out = out.rename(
+        columns={
+            "板块": "sector",
+            "涨跌幅": "pct_chg",
+            "总成交额": "amount",
+            "净流入": "net_inflow",
+            "上涨家数": "up_count",
+            "下跌家数": "down_count",
+        }
+    )
+    for col in ["pct_chg", "amount", "net_inflow", "rank_pct", "rank_amount", "rank_flow", "up_ratio", "up_count", "down_count"]:
+        if col in out.columns:
+            out[col] = numeric_series(out[col])
+    if "up_ratio" not in out.columns and {"up_count", "down_count"}.issubset(out.columns):
+        out["up_ratio"] = out["up_count"] / (out["up_count"] + out["down_count"]).replace(0, np.nan) * 100
+    return out
+
+
+def sector_persistence_score(history_df: pd.DataFrame | None, current_score: float = 50.0) -> dict[str, Any]:
+    df = normalize_sector_history(history_df).tail(16)
+    if df.empty:
+        return {"板块持续性分": clamp(current_score), "板块持续状态": "历史不足", "板块持续样本": 0, "板块前排次数": 0}
+    samples = int(len(df))
+    rank_pct = numeric_series(df.get("rank_pct", pd.Series(np.nan, index=df.index)))
+    rank_amount = numeric_series(df.get("rank_amount", pd.Series(np.nan, index=df.index)))
+    rank_flow = numeric_series(df.get("rank_flow", pd.Series(np.nan, index=df.index)))
+    pct_chg = numeric_series(df.get("pct_chg", pd.Series(np.nan, index=df.index)))
+    net_inflow = numeric_series(df.get("net_inflow", pd.Series(np.nan, index=df.index)))
+    up_ratio = numeric_series(df.get("up_ratio", pd.Series(np.nan, index=df.index)))
+
+    front = (rank_pct <= 10) | (rank_amount <= 12) | (rank_flow <= 12)
+    front_ratio = float(front.fillna(False).mean() * 100)
+    positive_ratio = float((pct_chg > 0).dropna().mean() * 100) if pct_chg.notna().any() else 50.0
+    inflow_ratio = float((net_inflow > 0).dropna().mean() * 100) if net_inflow.notna().any() else 50.0
+    latest_rank_score = np.nanmean(
+        [
+            linear_score(rank_pct.iloc[-1], 25, 1) if pd.notna(rank_pct.iloc[-1]) else np.nan,
+            linear_score(rank_amount.iloc[-1], 25, 1) if pd.notna(rank_amount.iloc[-1]) else np.nan,
+            linear_score(rank_flow.iloc[-1], 25, 1) if pd.notna(rank_flow.iloc[-1]) else np.nan,
+            linear_score(up_ratio.iloc[-1], 35, 80) if pd.notna(up_ratio.iloc[-1]) else np.nan,
+        ]
+    )
+    if pd.isna(latest_rank_score):
+        latest_rank_score = current_score
+    score = clamp(front_ratio * 0.34 + positive_ratio * 0.18 + inflow_ratio * 0.20 + latest_rank_score * 0.28)
+    if score >= 72:
+        label = "主线持续"
+    elif score >= 60:
+        label = "热度延续"
+    elif score >= 45:
+        label = "轮动观察"
+    else:
+        label = "热度退潮"
+    return {"板块持续性分": score, "板块持续状态": label, "板块持续样本": samples, "板块前排次数": int(front.fillna(False).sum())}
+
+
+def probability_label(value: float) -> str:
+    value = to_num(value)
+    if pd.isna(value):
+        return "样本不足"
+    if value >= 76:
+        return "高"
+    if value >= 64:
+        return "中高"
+    if value >= 52:
+        return "中性偏高"
+    if value >= 40:
+        return "中性"
+    return "低"
+
+
+def historical_signal_backtest(price_df: pd.DataFrame | None, mode: str = "etf") -> tuple[pd.DataFrame, pd.DataFrame]:
+    if price_df is None or price_df.empty or len(price_df) < 90:
+        return pd.DataFrame(), pd.DataFrame()
+    df = price_df.copy()
+    for col in ["open", "high", "low", "close", "volume", "amount"]:
+        if col in df.columns:
+            df[col] = numeric_series(df[col])
+    ind = add_indicators(df).reset_index(drop=True)
+    ind["high120"] = ind["close"].rolling(120, min_periods=20).max()
+    ind["drawdown120"] = (ind["close"] / ind["high120"] - 1).abs() * 100
+    records: list[dict[str, Any]] = []
+    max_forward = 10
+    for i in range(65, len(ind) - max_forward):
+        row = ind.iloc[i]
+        close = to_num(row.get("close"))
+        if pd.isna(close) or close <= 0:
+            continue
+        ma5, ma10, ma20, ma60 = [to_num(row.get(f"ma{w}")) for w in [5, 10, 20, 60]]
+        above_ma = sum(pd.notna(ma) and close > ma for ma in [ma5, ma10, ma20, ma60])
+        alignment = sum([pd.notna(ma5) and pd.notna(ma10) and ma5 > ma10, pd.notna(ma10) and pd.notna(ma20) and ma10 > ma20, pd.notna(ma20) and pd.notna(ma60) and ma20 > ma60])
+        ret5 = to_num(row.get("return5"))
+        ret10 = to_num(row.get("return10"))
+        ret20 = to_num(row.get("return20"))
+        amount_ratio5 = to_num(row.get("amount_ratio5"))
+        macd = to_num(row.get("macd"))
+        dea = to_num(row.get("macd_signal"))
+        macd_hist = to_num(row.get("macd_hist"))
+        drawdown120 = to_num(row.get("drawdown120"))
+        volatility20 = numeric_series(ind["pct"].iloc[max(0, i - 19) : i + 1]).std()
+        trend = clamp(above_ma / 4 * 32 + alignment / 3 * 22 + linear_score(ret5, -4.5, 6.5) * 0.18 + linear_score(ret20, -9, 13) * 0.18 + (70 if pd.notna(macd) and pd.notna(dea) and macd >= dea and macd_hist > 0 else 42) * 0.10)
+        momentum = clamp(linear_score(to_num(row.get("pct")), -2.5, 2.8) * 0.24 + linear_score(ret5, -4.5, 6.5) * 0.34 + linear_score(ret20, -9, 13) * 0.24 + linear_score(amount_ratio5, 0.6, 1.8) * (0.18 if mode == "etf" else 0.08))
+        risk = clamp(linear_score(drawdown120, 22, 3) * 0.45 + linear_score(volatility20, 4.2, 0.6) * 0.25 + linear_score(ret5, 12, -4) * 0.30)
+        total = clamp(trend * 0.42 + momentum * 0.34 + risk * 0.24)
+        broken_ma20 = pd.notna(ma20) and close < ma20
+        broken_ma60 = pd.notna(ma60) and close < ma60
+        overheat = pd.notna(ret5) and ret5 > 8 and pd.notna(ret10) and ret10 > 12
+        action = ""
+        if overheat:
+            action = "防追高"
+        elif broken_ma60 and pd.notna(ret20) and ret20 < -3:
+            action = "离场"
+        elif broken_ma20 or (pd.notna(ret5) and ret5 < -4):
+            action = "减仓"
+        elif total >= 74 and trend >= 62 and momentum >= 55 and risk >= 48:
+            action = "建仓"
+        elif total >= 68 and trend >= 60 and pd.notna(macd_hist) and macd_hist > 0 and not overheat:
+            action = "加仓"
+        if not action:
+            continue
+        fwd5 = (to_num(ind.iloc[i + 5].get("close")) / close - 1) * 100
+        fwd10 = (to_num(ind.iloc[i + 10].get("close")) / close - 1) * 100
+        next_low = numeric_series(ind["low"].iloc[i + 1 : i + 6]).min()
+        next_drawdown = (next_low / close - 1) * 100 if pd.notna(next_low) and close else np.nan
+        if action in {"建仓", "加仓"}:
+            success = fwd5 > 0
+        else:
+            success = (pd.notna(fwd5) and fwd5 <= 0) or (pd.notna(next_drawdown) and next_drawdown <= -1.5)
+        records.append(
+            {
+                "日期": row.get("date"),
+                "信号": action,
+                "当日收盘": close,
+                "5日后收益": fwd5,
+                "10日后收益": fwd10,
+                "后5日最大回撤": next_drawdown,
+                "成功": bool(success),
+                "历史综合分": total,
+            }
+        )
+    signals = pd.DataFrame(records)
+    if signals.empty:
+        return signals, pd.DataFrame()
+    stats = (
+        signals.groupby("信号", as_index=False)
+        .agg(样本数=("成功", "size"), 胜率=("成功", "mean"), 平均5日收益=("5日后收益", "mean"), 平均10日收益=("10日后收益", "mean"), 平均后5日最大回撤=("后5日最大回撤", "mean"))
+        .sort_values("样本数", ascending=False)
+    )
+    stats["胜率"] = stats["胜率"] * 100
+    return signals, stats
+
+
+def backtest_rate(stats_df: pd.DataFrame, signals: list[str], default: float = 50.0) -> tuple[float, int]:
+    if stats_df is None or stats_df.empty or "信号" not in stats_df.columns:
+        return default, 0
+    hit = stats_df[stats_df["信号"].isin(signals)]
+    if hit.empty:
+        return default, 0
+    weights = numeric_series(hit["样本数"]).clip(lower=1)
+    rate = float((numeric_series(hit["胜率"]) * weights).sum() / weights.sum())
+    return rate, int(weights.sum())
+
+
+def calibrated_probability(base: float, history_rate: float, history_samples: int, freshness_score: float, extra_score: float) -> float:
+    base = clamp(base)
+    history_weight = 0.18 if history_samples >= 8 else (0.08 if history_samples >= 3 else 0.0)
+    raw_prob = base * (0.78 - history_weight) + history_rate * history_weight + clamp(extra_score) * 0.14 + clamp(freshness_score) * 0.08
+    reliability = 0.55 + clamp(freshness_score) / 100 * 0.45
+    return clamp(50 + (raw_prob - 50) * reliability)
+
+
+def prediction_probabilities(model: dict[str, Any], mode: str, enhanced: dict[str, Any], stats_df: pd.DataFrame) -> dict[str, Any]:
+    factor_scores = model.get("factor_scores", {})
+    raw = model.get("raw", {})
+    total = to_num(model.get("total_score"))
+    trend = to_num(factor_scores.get("趋势分"))
+    risk = to_num(factor_scores.get("风险控制分"))
+    flow_cont = to_num(enhanced.get("资金连续性分"))
+    sector_cont = to_num(enhanced.get("板块持续性分"))
+    freshness_score = to_num(enhanced.get("快照可信度"))
+    if mode == "otc":
+        momentum = to_num(factor_scores.get("净值动能分"))
+        holding = to_num(factor_scores.get("持仓穿透分"))
+        heat = to_num(factor_scores.get("同类热度分"))
+        build_base = first_valid(to_num(raw.get("建仓评分")), total * 0.34 + trend * 0.20 + momentum * 0.15 + holding * 0.12 + heat * 0.09 + risk * 0.10)
+        add_base = first_valid(to_num(raw.get("加仓评分")), total * 0.30 + trend * 0.24 + momentum * 0.16 + holding * 0.16 + heat * 0.08 + risk * 0.06)
+    else:
+        volume = to_num(factor_scores.get("量能分"))
+        funds = to_num(factor_scores.get("资金分"))
+        heat = to_num(factor_scores.get("板块热度分"))
+        build_base = total * 0.34 + trend * 0.18 + volume * 0.14 + funds * 0.14 + heat * 0.10 + risk * 0.10
+        add_base = total * 0.30 + trend * 0.23 + funds * 0.18 + volume * 0.12 + heat * 0.10 + risk * 0.07
+    reduce_base = clamp((100 - risk) * 0.28 + (100 - trend) * 0.22 + (100 - flow_cont) * 0.18 + (100 - sector_cont) * 0.12 + linear_score(to_num(raw.get("ret5")), 4, -5) * 0.10 + linear_score(to_num(raw.get("drawdown120", raw.get("drawdown20"))), 3, 18) * 0.10)
+    if str(model.get("action", "")).startswith("减仓"):
+        reduce_base = clamp(reduce_base + 12)
+    if str(model.get("action", "")).startswith("离场"):
+        reduce_base = clamp(reduce_base + 20)
+    build_hist, build_n = backtest_rate(stats_df, ["建仓"])
+    add_hist, add_n = backtest_rate(stats_df, ["加仓"])
+    reduce_hist, reduce_n = backtest_rate(stats_df, ["减仓", "离场", "防追高"])
+    build_extra = flow_cont * 0.48 + sector_cont * 0.34 + risk * 0.18
+    add_extra = flow_cont * 0.46 + sector_cont * 0.30 + trend * 0.24
+    reduce_extra = (100 - flow_cont) * 0.38 + (100 - sector_cont) * 0.28 + (100 - risk) * 0.34
+    build_prob = calibrated_probability(build_base, build_hist, build_n, freshness_score, build_extra)
+    add_prob = calibrated_probability(add_base, add_hist, add_n, freshness_score, add_extra)
+    reduce_prob = calibrated_probability(reduce_base, reduce_hist, reduce_n, freshness_score, reduce_extra)
+    best_action = max([("建仓", build_prob), ("加仓", add_prob), ("减仓", reduce_prob)], key=lambda item: item[1])
+    return {
+        "建仓概率": build_prob,
+        "加仓概率": add_prob,
+        "减仓概率": reduce_prob,
+        "概率标签": f"{best_action[0]}{probability_label(best_action[1])}",
+        "历史建仓胜率": build_hist,
+        "历史建仓样本": build_n,
+        "历史加仓胜率": add_hist,
+        "历史加仓样本": add_n,
+        "历史风控胜率": reduce_hist,
+        "历史风控样本": reduce_n,
+    }
+
+
+def first_valid(*values: float) -> float:
+    for value in values:
+        if pd.notna(value):
+            return value
+    return np.nan
+
+
+def enhance_prediction_model(
+    model: dict[str, Any],
+    mode: str,
+    price_df: pd.DataFrame | None,
+    flow_history: pd.DataFrame | None,
+    sector_history: pd.DataFrame | None,
+    current_row: pd.Series | dict[str, Any] | None,
+    current_sector_score: float,
+) -> dict[str, Any]:
+    enhanced: dict[str, Any] = {}
+    enhanced.update(flow_continuity_score(flow_history, mode=mode))
+    enhanced.update(sector_persistence_score(sector_history, current_score=current_sector_score))
+    enhanced.update(snapshot_freshness(current_row, flow_history))
+    signals, stats = historical_signal_backtest(price_df, mode=mode)
+    enhanced.update(prediction_probabilities(model, mode, enhanced, stats))
+    model["enhanced"] = enhanced
+    model["backtest_signals"] = signals
+    model["backtest_stats"] = stats
+    model.setdefault("raw", {}).update(enhanced)
+    return model
 
 
 def latest_spot_row(spot_df: pd.DataFrame | None, code: str) -> pd.Series | None:
@@ -2249,7 +2692,7 @@ def format_open_fund_display(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["日增长值", "日增长率"]:
         if col in out:
             out[col] = out[col].map(lambda x: pct_text(to_num(x)) if col == "日增长率" else (f"{to_num(x):.4f}" if pd.notna(to_num(x)) else "-"))
-    for col in ["估算涨幅", "估算偏差", "公布日增长率", "实时穿透涨幅", "重仓估算贡献", "前20持仓权重", "上涨重仓股比例", "主力流入权重占比", "近5日", "近10日", "近20日", "120日回撤"]:
+    for col in ["估算涨幅", "估算偏差", "公布日增长率", "实时穿透涨幅", "重仓估算贡献", "前20持仓权重", "上涨重仓股比例", "主力流入权重占比", "近5日", "近10日", "近20日", "120日回撤", "建仓概率", "加仓概率", "减仓概率"]:
         if col in out:
             out[col] = out[col].map(lambda x: pct_text(to_num(x)))
     for col in ["估算净值", "实时穿透净值", "公布单位净值", "上一净值"]:
@@ -2257,7 +2700,7 @@ def format_open_fund_display(df: pd.DataFrame) -> pd.DataFrame:
             out[col] = out[col].map(lambda x: f"{to_num(x):.4f}" if pd.notna(to_num(x)) else "-")
     if "场外机会分" in out:
         out["场外机会分"] = out["场外机会分"].map(lambda x: f"{to_num(x):.1f}" if pd.notna(to_num(x)) else "-")
-    for col in ["场外短线评分", "趋势分", "净值动能分", "持仓穿透分", "同类热度分", "风险控制分", "建仓评分", "加仓评分", "资金确认分", "行情覆盖率"]:
+    for col in ["场外短线评分", "趋势分", "净值动能分", "持仓穿透分", "同类热度分", "风险控制分", "建仓评分", "加仓评分", "资金确认分", "行情覆盖率", "资金连续性分", "板块持续性分", "快照可信度"]:
         if col in out:
             out[col] = out[col].map(lambda x: f"{to_num(x):.1f}" if pd.notna(to_num(x)) else "-")
     for col in ["重仓主力净额", "加权主力净额"]:
@@ -2268,8 +2711,8 @@ def format_open_fund_display(df: pd.DataFrame) -> pd.DataFrame:
             out[col] = out[col].map(lambda x: f"{to_num(x):.4f}" if pd.notna(to_num(x)) else "-")
     if "上涨重仓股数" in out:
         out["上涨重仓股数"] = out["上涨重仓股数"].map(lambda x: f"{to_num(x):.0f}" if pd.notna(to_num(x)) else "-")
-    cols = ["基金代码", "基金简称", "基金类型", "场外短线评分", "动作", "建仓评分", "建仓信号", "加仓评分", "加仓信号", "仓位动作", "信号依据"]
-    cols += ["估算涨幅", "实时穿透涨幅", "穿透来源", "重仓估算贡献", "资金确认分", "重仓主力净额", "加权主力净额", "主力流入权重占比", "行情覆盖率", "近5日", "近20日", "120日回撤"]
+    cols = ["基金代码", "基金简称", "基金类型", "场外短线评分", "动作", "建仓概率", "加仓概率", "减仓概率", "概率标签", "建仓评分", "建仓信号", "加仓评分", "加仓信号", "仓位动作", "信号依据"]
+    cols += ["估算涨幅", "实时穿透涨幅", "穿透来源", "重仓估算贡献", "资金确认分", "资金连续性分", "资金连续状态", "板块持续性分", "板块持续状态", "快照可信度", "快照状态", "重仓主力净额", "加权主力净额", "主力流入权重占比", "行情覆盖率", "近5日", "近20日", "120日回撤"]
     cols += ["实时穿透净值", "估算净值", "估算偏差", "最新单位净值", "日增长率", "前20持仓权重", "上涨重仓股数", "上涨重仓股比例", "DIF", "DEA", "MACD柱"]
     cols += ["场外机会分", "盯盘提示", "申购状态", "赎回状态", "手续费", "快照时间"]
     cols += [col for col in out.columns if ("单位净值" in col or "累计净值" in col or col in {"公布日增长率", "公布单位净值", "上一净值", "估算日期", "数据来源"}) and col not in cols]
@@ -2335,6 +2778,7 @@ def filter_otc_snapshot_table(snapshot_df: pd.DataFrame | None, codes: list[str]
         df = df.sort_values("场外短线评分", ascending=False, na_position="last")
     df = sanitize_otc_realtime_columns(df)
     df = ensure_otc_position_columns(df, market_score=market_score)
+    df = ensure_otc_prediction_columns(df)
     return df.reset_index(drop=True)
 
 
@@ -2702,6 +3146,42 @@ def score_badge(action: str, tone: str) -> str:
     }
     bg, fg = colors.get(tone, colors["neutral"])
     return f"<span class='badge' style='background:{bg};color:{fg}'>{action}</span>"
+
+
+def render_prediction_panel(model: dict[str, Any], title: str = "增强预测与历史胜率") -> None:
+    enhanced = model.get("enhanced", {})
+    stats = model.get("backtest_stats")
+    signals = model.get("backtest_signals")
+    st.subheader(title)
+    cols = st.columns(6)
+    cols[0].metric("建仓概率", pct_text(to_num(enhanced.get("建仓概率"))))
+    cols[1].metric("加仓概率", pct_text(to_num(enhanced.get("加仓概率"))))
+    cols[2].metric("减仓概率", pct_text(to_num(enhanced.get("减仓概率"))))
+    cols[3].metric("资金连续性", score_text(enhanced.get("资金连续性分")), delta=str(enhanced.get("资金连续状态") or "-"))
+    cols[4].metric("板块持续性", score_text(enhanced.get("板块持续性分")), delta=str(enhanced.get("板块持续状态") or "-"))
+    cols[5].metric("快照可信度", score_text(enhanced.get("快照可信度")), delta=str(enhanced.get("快照状态") or "-"))
+    st.caption(
+        f"概率标签：{enhanced.get('概率标签', '-')}；"
+        f"资金样本 {enhanced.get('资金连续样本', 0)}，板块样本 {enhanced.get('板块持续样本', 0)}，"
+        f"快照年龄 {to_num(enhanced.get('快照年龄分钟')):.0f} 分钟。"
+    )
+    if stats is not None and not stats.empty:
+        display_stats = stats.copy()
+        for col in ["胜率", "平均5日收益", "平均10日收益", "平均后5日最大回撤"]:
+            if col in display_stats:
+                display_stats[col] = display_stats[col].map(lambda x: pct_text(to_num(x)))
+        st.dataframe(display_stats, use_container_width=True, hide_index=True)
+    else:
+        st.info("历史样本不足，暂不展示胜率统计。")
+    if signals is not None and not signals.empty:
+        recent = signals.tail(20).copy()
+        for col in ["5日后收益", "10日后收益", "后5日最大回撤"]:
+            if col in recent:
+                recent[col] = recent[col].map(lambda x: pct_text(to_num(x)))
+        if "当日收盘" in recent:
+            recent["当日收盘"] = recent["当日收盘"].map(lambda x: f"{to_num(x):.4f}" if pd.notna(to_num(x)) else "-")
+        st.caption("最近 20 个历史信号。买入/加仓以 5 日后收益为正计成功；减仓/离场/防追高以随后走弱或回撤防守有效计成功。")
+        st.dataframe(recent, use_container_width=True, hide_index=True)
 
 
 def render_model_references() -> None:
@@ -3130,6 +3610,19 @@ else:
 latest = model["latest"]
 raw = model["raw"]
 factor_scores = model["factor_scores"]
+etf_history_df, etf_history_status = get_etf_spot_history_from_db(code)
+etf_sector_history_df, etf_sector_history_status = get_sector_heat_history_from_db(sector_name or model.get("sector_info", {}).get("sector"))
+model = enhance_prediction_model(
+    model,
+    mode="etf",
+    price_df=daily_df,
+    flow_history=etf_history_df,
+    sector_history=etf_sector_history_df,
+    current_row=spot_row,
+    current_sector_score=to_num(factor_scores.get("板块热度分")),
+)
+raw = model["raw"]
+factor_scores = model["factor_scores"]
 leaderboard = build_etf_leaderboard(etf_spot, leaderboard_size)
 watchlist_table = build_realtime_etf_table(etf_spot, codes=watchlist_codes)
 etf_holding_impact, etf_estimated_contribution = build_holding_impact_table(holdings_df, a_spot)
@@ -3139,6 +3632,7 @@ else:
     otc_watchlist_table = build_open_fund_watch_table(open_fund_daily, fund_names, otc_watchlist_codes, open_fund_estimation)
     otc_watchlist_table = sanitize_otc_realtime_columns(otc_watchlist_table)
     otc_watchlist_table = ensure_otc_position_columns(otc_watchlist_table, market_score=market_env.get("score", 50))
+    otc_watchlist_table = ensure_otc_prediction_columns(otc_watchlist_table)
 otc_row = latest_open_fund_row(open_fund_daily, otc_code)
 if otc_row is None:
     otc_row = snapshot_to_open_fund_row(otc_snapshot_focus_row)
@@ -3166,6 +3660,18 @@ else:
         otc_sector_name,
         market_env,
     )
+otc_factor_scores = otc_model["factor_scores"]
+otc_history_df, otc_history_status = get_otc_watch_history_from_db(otc_code)
+otc_sector_history_df, otc_sector_history_status = get_sector_heat_history_from_db(otc_sector_name or otc_model.get("sector_info", {}).get("sector"))
+otc_model = enhance_prediction_model(
+    otc_model,
+    mode="otc",
+    price_df=otc_model.get("price_df"),
+    flow_history=otc_history_df,
+    sector_history=otc_sector_history_df,
+    current_row=otc_snapshot_focus_row if otc_snapshot_focus_row is not None else otc_row,
+    current_sector_score=to_num(otc_factor_scores.get("同类热度分")),
+)
 otc_factor_scores = otc_model["factor_scores"]
 otc_raw = otc_model["raw"]
 perf_mark("模型计算")
@@ -3254,6 +3760,13 @@ if fund_mode == "场外基金":
         fund_flow_cols[1].metric("重仓主力净额", format_money(to_num(otc_raw.get("main_flow"))))
         fund_flow_cols[2].metric("主力流入权重", pct_text(to_num(otc_raw.get("positive_flow_weight"))))
         fund_flow_cols[3].metric("穿透来源", str(otc_raw.get("through_source") or "-"))
+        otc_prob_cols = st.columns(6)
+        otc_prob_cols[0].metric("建仓概率", pct_text(to_num(otc_raw.get("建仓概率"))))
+        otc_prob_cols[1].metric("加仓概率", pct_text(to_num(otc_raw.get("加仓概率"))))
+        otc_prob_cols[2].metric("减仓概率", pct_text(to_num(otc_raw.get("减仓概率"))))
+        otc_prob_cols[3].metric("资金连续性", score_text(otc_raw.get("资金连续性分")), delta=str(otc_raw.get("资金连续状态") or "-"))
+        otc_prob_cols[4].metric("板块持续性", score_text(otc_raw.get("板块持续性分")), delta=str(otc_raw.get("板块持续状态") or "-"))
+        otc_prob_cols[5].metric("快照可信度", score_text(otc_raw.get("快照可信度")), delta=str(otc_raw.get("快照状态") or "-"))
 
         st.subheader("场外自选基金短线操作评分排行")
         if otc_watchlist_table.empty:
@@ -3271,7 +3784,7 @@ if fund_mode == "场外基金":
                         y=name_col,
                         color="动作" if "动作" in chart_df.columns else None,
                         orientation="h",
-                        hover_data=[col for col in ["基金代码", "建仓评分", "建仓信号", "加仓评分", "加仓信号", "仓位动作", "资金确认分", "重仓主力净额", "主力流入权重占比", "估算涨幅", "实时穿透涨幅", "穿透来源", "重仓估算贡献", "近5日", "120日回撤", "快照时间"] if col in chart_df.columns],
+                        hover_data=[col for col in ["基金代码", "建仓概率", "加仓概率", "减仓概率", "概率标签", "建仓评分", "建仓信号", "加仓评分", "加仓信号", "仓位动作", "资金确认分", "资金连续性分", "板块持续性分", "快照可信度", "重仓主力净额", "主力流入权重占比", "估算涨幅", "实时穿透涨幅", "穿透来源", "重仓估算贡献", "近5日", "120日回撤", "快照时间"] if col in chart_df.columns],
                     )
                     fig.update_layout(height=max(260, min(520, 42 * len(chart_df) + 120)), margin=dict(l=10, r=10, t=10, b=10))
                     st.plotly_chart(fig, use_container_width=True)
@@ -3297,7 +3810,7 @@ if fund_mode == "场外基金":
                         orientation="h",
                         barmode="group",
                         range_x=[0, 100],
-                        hover_data=[col for col in ["基金代码", "建仓信号", "加仓信号", "仓位动作"] if col in long_df.columns],
+                        hover_data=[col for col in ["基金代码", "建仓信号", "加仓信号", "仓位动作", "概率标签"] if col in long_df.columns],
                     )
                     fig_signal.update_layout(height=max(260, min(560, 50 * len(signal_chart_df) + 120)), margin=dict(l=10, r=10, t=10, b=10))
                     st.plotly_chart(fig_signal, use_container_width=True)
@@ -3363,6 +3876,11 @@ if fund_mode == "场外基金":
         flow_cols[2].metric("加权主力净额", format_money(to_num(otc_raw.get("weighted_main_flow"))))
         flow_cols[3].metric("流入权重占比", pct_text(to_num(otc_raw.get("positive_flow_weight"))))
         flow_cols[4].metric("行情覆盖率", pct_text(to_num(otc_raw.get("quote_coverage"))))
+        continuity_cols = st.columns(4)
+        continuity_cols[0].metric("资金连续性分", score_text(otc_raw.get("资金连续性分")), delta=str(otc_raw.get("资金连续状态") or "-"))
+        continuity_cols[1].metric("板块持续性分", score_text(otc_raw.get("板块持续性分")), delta=str(otc_raw.get("板块持续状态") or "-"))
+        continuity_cols[2].metric("快照可信度", score_text(otc_raw.get("快照可信度")), delta=str(otc_raw.get("快照状态") or "-"))
+        continuity_cols[3].metric("概率标签", str(otc_raw.get("概率标签") or "-"))
         if otc_holding_impact is not None and not otc_holding_impact.empty and "主力净流入-净额" in otc_holding_impact:
             st.metric("重仓主力净额", format_money(numeric_series(otc_holding_impact["主力净流入-净额"]).sum()))
         if otc_holding_impact is not None and not otc_holding_impact.empty:
@@ -3397,6 +3915,7 @@ if fund_mode == "场外基金":
             if otc_sector_name and sector_info.get("sector") not in {"无板块数据", "未匹配具体行业"}:
                 st.metric("板块", otc_sector_name, delta=pct_text(to_num(sector_info.get("pct_chg"))))
                 st.write(f"成交额排名：{to_num(sector_info.get('rank_amount')):.0f} ｜ 资金排名：{to_num(sector_info.get('rank_flow')):.0f}")
+                st.metric("板块持续性分", score_text(otc_raw.get("板块持续性分")), delta=str(otc_raw.get("板块持续状态") or "-"))
             else:
                 st.write(sector_info.get("note", "未映射到明确板块，按同类日表现和市场环境处理。"))
 
@@ -3471,9 +3990,10 @@ if fund_mode == "场外基金":
         )
         st.write("建仓评分：更看重趋势刚确认、净值动能转强、实时穿透为正、同类/板块升温，同时要求不过热、回撤风险可控。")
         st.write("加仓评分：更看重已成立趋势的延续、MACD/DIF-DEA确认、重仓股穿透继续贡献、同类热度仍在前排；短线过热或回撤风险偏高时禁止加仓。")
+        render_prediction_panel(otc_model)
         render_model_references()
         st.subheader("数据源状态")
-        statuses = [otc_watch_snapshot_status, open_fund_daily_status, open_fund_estimation_status, fund_names_status, otc_nav_status, otc_basic_status, otc_achievement_status, otc_asset_status, *otc_holdings_statuses, *index_statuses, sector_status, a_spot_status]
+        statuses = [otc_watch_snapshot_status, otc_history_status, otc_sector_history_status, open_fund_daily_status, open_fund_estimation_status, fund_names_status, otc_nav_status, otc_basic_status, otc_achievement_status, otc_asset_status, *otc_holdings_statuses, *index_statuses, sector_status, a_spot_status]
         status_df = pd.DataFrame([{"数据源": s.get("label"), "状态": "OK" if s.get("ok") else "FAIL", "说明": s.get("detail")} for s in statuses])
         st.dataframe(status_df, use_container_width=True, hide_index=True)
 
@@ -3514,6 +4034,14 @@ metric_row1[2].metric("成交额", format_money(latest_amount))
 metric_row2[0].metric("主力净额", format_money(main_amount), delta=pct_text(main_ratio))
 metric_row2[1].metric("量能倍数", f"{raw.get('amount_ratio5', np.nan):.2f}x", delta=f"20日 {raw.get('amount_ratio20', np.nan):.2f}x")
 metric_row2[2].metric("折溢价", pct_text(premium))
+enhanced_raw = model.get("enhanced", {})
+metric_row3 = st.columns(6)
+metric_row3[0].metric("建仓概率", pct_text(to_num(enhanced_raw.get("建仓概率"))))
+metric_row3[1].metric("加仓概率", pct_text(to_num(enhanced_raw.get("加仓概率"))))
+metric_row3[2].metric("减仓概率", pct_text(to_num(enhanced_raw.get("减仓概率"))))
+metric_row3[3].metric("资金连续性", score_text(enhanced_raw.get("资金连续性分")), delta=str(enhanced_raw.get("资金连续状态") or "-"))
+metric_row3[4].metric("板块持续性", score_text(enhanced_raw.get("板块持续性分")), delta=str(enhanced_raw.get("板块持续状态") or "-"))
+metric_row3[5].metric("快照可信度", score_text(enhanced_raw.get("快照可信度")), delta=str(enhanced_raw.get("快照状态") or "-"))
 
 st.subheader("场内自选池实时盯盘")
 if watchlist_table.empty:
@@ -3587,6 +4115,10 @@ elif etf_view == etf_view_options[2]:
         }
         spot_table = pd.DataFrame({"指标": spot_fields.keys(), "数值": spot_fields.values()})
         st.dataframe(spot_table, use_container_width=True, hide_index=True)
+        flow_detail_cols = st.columns(3)
+        flow_detail_cols[0].metric("资金连续性分", score_text(raw.get("资金连续性分")), delta=str(raw.get("资金连续状态") or "-"))
+        flow_detail_cols[1].metric("快照可信度", score_text(raw.get("快照可信度")), delta=str(raw.get("快照状态") or "-"))
+        flow_detail_cols[2].metric("概率标签", str(raw.get("概率标签") or "-"))
     with right:
         st.subheader("实时 ETF 机会榜")
         display_leaderboard = leaderboard.copy()
@@ -3615,6 +4147,7 @@ elif etf_view == etf_view_options[3]:
             st.metric("板块", sector_name, delta=pct_text(to_num(sector_info.get("pct_chg"))))
             st.write(f"成交额排名：{to_num(sector_info.get('rank_amount')):.0f} ｜ 资金排名：{to_num(sector_info.get('rank_flow')):.0f} ｜ 上涨占比：{pct_text(to_num(sector_info.get('up_ratio')))}")
             st.write(f"领涨股：{sector_info.get('leader', '-')}")
+            st.metric("板块持续性分", score_text(raw.get("板块持续性分")), delta=str(raw.get("板块持续状态") or "-"))
         else:
             st.write(sector_info.get("note", "未匹配到具体行业。"))
 
@@ -3718,10 +4251,11 @@ elif etf_view == etf_view_options[6]:
     st.write("减仓：高位放量滞涨，或价格跌破10日线且主力净流出。")
     st.write("买入观察：总分不低于72，趋势、量能、资金和风险均达到最低确认，且市场环境分不低于42。")
     st.write("持有：总分不低于58，未跌破20日线，且未出现明显主力流出。")
+    render_prediction_panel(model)
     render_model_references()
 
     st.subheader("数据源状态")
-    statuses = [spot_status, *daily_statuses, *index_statuses, overview_status, nav_status, *holdings_statuses, sector_status, a_spot_status]
+    statuses = [spot_status, etf_history_status, etf_sector_history_status, *daily_statuses, *index_statuses, overview_status, nav_status, *holdings_statuses, sector_status, a_spot_status]
     status_df = pd.DataFrame([{"数据源": s.get("label"), "状态": "OK" if s.get("ok") else "FAIL", "说明": s.get("detail")} for s in statuses])
     st.dataframe(status_df, use_container_width=True, hide_index=True)
     st.subheader("数据库摘要")
