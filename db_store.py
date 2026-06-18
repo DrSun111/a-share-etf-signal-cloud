@@ -384,6 +384,87 @@ def load_latest_otc_watch_snapshot() -> tuple[pd.DataFrame | None, dict[str, Any
     return _load_latest_payloads_by_code("otc_watch_snapshot")
 
 
+def _load_payload_history_by_code(table: str, code: str, limit: int = 40) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    init_db()
+    code = "".join(ch for ch in str(code or "") if ch.isdigit())[-6:].zfill(6)
+    if not code:
+        return None, {"ok": False, "label": f"{table}-历史快照", "detail": "代码为空"}
+    limit = max(1, min(int(limit or 40), 300))
+    sql = f"""
+        SELECT snapshot_ts, payload_json
+        FROM {table}
+        WHERE code = ?
+        ORDER BY snapshot_ts DESC
+        LIMIT ?
+    """
+    url = database_url()
+    if is_sqlite_url(url):
+        with _sqlite_conn(url) as conn:
+            rows = conn.execute(sql, (code, limit)).fetchall()
+    else:
+        from sqlalchemy import text
+
+        engine = _pg_engine(url)
+        with engine.begin() as conn:
+            rows = conn.execute(
+                text(sql.replace("?", ":code", 1).replace("?", ":limit", 1)),
+                {"code": code, "limit": limit},
+            ).fetchall()
+
+    records = []
+    for snapshot_ts, payload_json in rows:
+        payload = json.loads(payload_json)
+        payload["_snapshot_ts"] = snapshot_ts
+        records.append(payload)
+    records.reverse()
+    if not records:
+        return None, {"ok": False, "label": f"{table}-历史快照", "detail": f"{code} 暂无历史快照"}
+    return pd.DataFrame(records), {"ok": True, "label": f"{table}-历史快照", "detail": f"{code} {len(records)} 条"}
+
+
+def load_etf_spot_history(code: str, limit: int = 40) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    return _load_payload_history_by_code("etf_spot_snapshot", code, limit)
+
+
+def load_otc_watch_history(code: str, limit: int = 40) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    return _load_payload_history_by_code("otc_watch_snapshot", code, limit)
+
+
+def load_sector_heat_history(sector: str | None, limit: int = 40) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    init_db()
+    sector = str(sector or "").strip()
+    if not sector or sector in {"无板块数据", "未匹配具体行业", "后台快照极速模式", "后台快照缺失"}:
+        return None, {"ok": False, "label": "sector_heat_snapshot-历史快照", "detail": "板块为空或未匹配"}
+    limit = max(1, min(int(limit or 40), 300))
+    sql = """
+        SELECT snapshot_ts, payload_json
+        FROM sector_heat_snapshot
+        WHERE sector = ?
+        ORDER BY snapshot_ts DESC
+        LIMIT ?
+    """
+    url = database_url()
+    if is_sqlite_url(url):
+        with _sqlite_conn(url) as conn:
+            rows = conn.execute(sql, (sector, limit)).fetchall()
+    else:
+        from sqlalchemy import text
+
+        engine = _pg_engine(url)
+        with engine.begin() as conn:
+            rows = conn.execute(text(sql.replace("?", ":sector", 1).replace("?", ":limit", 1)), {"sector": sector, "limit": limit}).fetchall()
+
+    records = []
+    for snapshot_ts, payload_json in rows:
+        payload = json.loads(payload_json)
+        payload["_snapshot_ts"] = snapshot_ts
+        records.append(payload)
+    records.reverse()
+    if not records:
+        return None, {"ok": False, "label": "sector_heat_snapshot-历史快照", "detail": f"{sector} 暂无历史快照"}
+    return pd.DataFrame(records), {"ok": True, "label": "sector_heat_snapshot-历史快照", "detail": f"{sector} {len(records)} 条"}
+
+
 def load_latest_otc_nav_history(code: str) -> tuple[pd.DataFrame | None, dict[str, Any]]:
     init_db()
     code = "".join(ch for ch in str(code or "") if ch.isdigit())[-6:].zfill(6)
