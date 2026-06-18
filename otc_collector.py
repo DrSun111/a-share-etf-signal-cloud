@@ -121,6 +121,21 @@ def safe_weighted_contribution(weight: pd.Series, pct: pd.Series) -> pd.Series:
     return weight_num * pct_num / 100
 
 
+def probability_label(value: float) -> str:
+    value = to_num(value)
+    if pd.isna(value):
+        return "样本不足"
+    if value >= 76:
+        return "高"
+    if value >= 64:
+        return "中高"
+    if value >= 52:
+        return "中性偏高"
+    if value >= 40:
+        return "中性"
+    return "低"
+
+
 def position_signal_scores(
     total_score: float,
     trend_score: float,
@@ -249,6 +264,17 @@ def position_signal_scores(
     if not reasons:
         reasons.append("信号不足")
 
+    build_probability = clamp(build_score * 0.62 + fund_flow_score * 0.14 + heat_score * 0.10 + risk_score * 0.14)
+    add_probability = clamp(add_score * 0.62 + fund_flow_score * 0.16 + trend_score * 0.12 + heat_score * 0.10)
+    reduce_probability = clamp(
+        (100 - risk_score) * 0.34
+        + (100 - trend_score) * 0.20
+        + (100 - fund_flow_score) * 0.18
+        + (100 - heat_score) * 0.12
+        + linear_score(drawdown120, 3, 18) * 0.16
+    )
+    best_probability = max([("建仓", build_probability), ("加仓", add_probability), ("减仓", reduce_probability)], key=lambda item: item[1])
+
     return {
         "建仓评分": build_score,
         "建仓信号": build_signal,
@@ -256,6 +282,10 @@ def position_signal_scores(
         "加仓信号": add_signal,
         "仓位动作": position_action,
         "信号依据": "、".join(reasons[:4]),
+        "建仓概率": build_probability,
+        "加仓概率": add_probability,
+        "减仓概率": reduce_probability,
+        "概率标签": f"{best_probability[0]}{probability_label(best_probability[1])}",
     }
 
 
@@ -853,6 +883,12 @@ def score_watch_item(
         "场外短线评分": clamp(total),
         "动作": action,
         **position_signal,
+        "资金连续性分": flow_score,
+        "资金连续状态": "单次资金确认" if flow_score >= 58 else ("单次资金偏弱" if flow_score < 45 else "单次中性"),
+        "板块持续性分": heat_score,
+        "板块持续状态": "同类热度代理",
+        "快照可信度": 96.0,
+        "快照状态": "新快照",
         "申购状态": str(daily_row.get("申购状态") or "-") if daily_row is not None else "-",
         "赎回状态": str(daily_row.get("赎回状态") or "-") if daily_row is not None else "-",
         "手续费": str(daily_row.get("手续费") or "-") if daily_row is not None else "-",
